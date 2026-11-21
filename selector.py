@@ -826,12 +826,20 @@ def analyze_python(path: str, old: str, new: str, removed, added, cov: CoverageM
     new_by = {sc.qual: sc for sc in new_scopes}
 
     candidates: set[str] = set()
+
+    def add(scs, ln):
+        # A line where a scope starts (a lambda inside a dict entry, a one-line
+        # def) also holds code of the enclosing scope: count both.
+        sc = innermost(scs, ln)
+        candidates.add(sc.qual if sc else "")
+        while sc is not None and sc.node.lineno == ln:
+            sc = innermost([x for x in scs if x is not sc and x.first <= sc.node.lineno and sc.node.end_lineno <= x.last], ln)
+            candidates.add(sc.qual if sc else "")
+
     for ln in removed:
-        sc = innermost(old_scopes, ln)
-        candidates.add(sc.qual if sc else "")
+        add(old_scopes, ln)
     for ln in added:
-        sc = innermost(new_scopes, ln)
-        candidates.add(sc.qual if sc else "")
+        add(new_scopes, ln)
 
     sel = 0
     kinds = []
