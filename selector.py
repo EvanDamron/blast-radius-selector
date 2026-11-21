@@ -337,7 +337,8 @@ def skeleton(tree: ast.Module) -> list[tuple[str, str, ast.AST]]:
 
 
 def _is_docstring(st) -> bool:
-    return isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant) and isinstance(st.value.value, str)
+    """Statements with no effect: docstrings, other bare constants, pass."""
+    return isinstance(st, ast.Pass) or (isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant))
 
 
 # ------------------------------------------------------------ module-level detail
@@ -384,7 +385,10 @@ def readers(names: set[str], cov: CoverageMap, exclude: tuple[str, int, int], te
     names = {n for n in names if n}
     if not names:
         return 0
-    pat = re.compile(r"\b(?:" + "|".join(sorted(map(re.escape, names))) + r")\b")
+    alt = "|".join(sorted(map(re.escape, names)))
+    pat = re.compile(r"\b(?:" + alt + r")\b")
+    # `NAME = value` or `NAME: annotation` defines the name; only the value can read it.
+    definition = re.compile(r"^\s*(?:" + alt + r")\s*(?::[^=]*)?(?:=(?!=)(.*))?$")
     bits = 0
     ex_path, ex_first, ex_last = exclude
     for rel, text in sources().items():
@@ -393,8 +397,12 @@ def readers(names: set[str], cov: CoverageMap, exclude: tuple[str, int, int], te
         if not pat.search(text):
             continue
         for i, line in enumerate(text.split("\n"), 1):
-            if pat.search(line) and not (rel == ex_path and ex_first <= i <= ex_last):
-                bits |= cov.at_line(rel, i)
+            if not pat.search(line) or (rel == ex_path and ex_first <= i <= ex_last):
+                continue
+            d = definition.match(line)
+            if d and not pat.search(d.group(1) or ""):
+                continue
+            bits |= cov.at_line(rel, i)
     return bits
 
 
