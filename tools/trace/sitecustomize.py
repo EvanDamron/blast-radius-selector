@@ -24,17 +24,41 @@ if _dir:
     _getframe = sys._getframe
 
     def _start(code, offset):
-        # Expr.__init__ is starting: note the concrete expression class.
-        try:
-            cls = type(_getframe(1).f_locals["self"])
-            _classes.add(cls.__module__ + ":" + cls.__qualname__)
-        except Exception:
-            pass
+        if code.co_qualname == "Expr.__init__" and code.co_filename.endswith("sqlglot/expressions/core.py"):
+            # Expr.__init__ is starting: note the concrete expression class.
+            try:
+                cls = type(_getframe(1).f_locals["self"])
+                _classes.add(cls.__module__ + ":" + cls.__qualname__)
+            except Exception:
+                pass
+            return None
+        # LINE events skip the line a function starts on (one-line lambdas and
+        # defs would look unexecuted), so record the lines run before the first
+        # line change here.
+        f = code.co_filename
+        if f.startswith(_PREFIX):
+            first = None
+            for start, end, ln in code.co_lines():
+                if ln is None:
+                    continue
+                if first is None:
+                    first = ln
+                    _add(code, f, ln)
+                elif ln != first:
+                    _add(code, f, ln)  # the line after RESUME, e.g. a decorated one-liner
+                    break
+        return _DISABLE
+
+    def _add(code, f, line):
+        if not code.co_flags & 1:
+            f = "B" + f
+        s = _lines.get(f)
+        if s is None:
+            s = _lines[f] = set()
+        s.add(line)
 
     def _line(code, line):
         f = code.co_filename
-        if code.co_qualname == "Expr.__init__" and f.endswith("sqlglot/expressions/core.py"):
-            _mon.set_local_events(_TOOL, code, _mon.events.PY_START)
         if f.startswith(_PREFIX):
             # Function code (CO_OPTIMIZED) and module/class-body code are kept apart:
             # a lambda in a class-level dict shares its first line with the dict.
@@ -71,6 +95,6 @@ if _dir:
     _mon.use_tool_id(_TOOL, "brtrace")
     _mon.register_callback(_TOOL, _mon.events.LINE, _line)
     _mon.register_callback(_TOOL, _mon.events.PY_START, _start)
-    _mon.set_events(_TOOL, _mon.events.LINE)
+    _mon.set_events(_TOOL, _mon.events.LINE | _mon.events.PY_START)
     sys.addaudithook(_audit)
     atexit.register(_dump)
