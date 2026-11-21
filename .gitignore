@@ -1,0 +1,9 @@
+# local working data: sqlglot clone, venv, traces, labels, scratch
+work/
+files/
+starter/
+output.jsonl
+__pycache__/
+*.pyc
+.DS_Store
+.env
