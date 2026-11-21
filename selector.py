@@ -752,6 +752,89 @@ def narrow_by_fixture_reads(c: Commit) -> None:
         narrow_file(c, path, keep, "fixture-parts")
 
 
+# ------------------------------------------------------------ annotations
+
+USE_ANNOTATIONS = os.environ.get("BR_USE_ANNOTATIONS", "1") == "1"
+
+
+def _future_annotations(tree: ast.Module) -> bool:
+    return any(
+        isinstance(st, ast.ImportFrom) and st.module == "__future__" and any(a.name == "annotations" for a in st.names)
+        for st in tree.body
+    )
+
+
+def _strip_function_annotations(tree: ast.Module) -> str:
+    """Dump with parameter and return annotations removed, and annotations of local
+    variables inside functions. Under `from __future__ import annotations` these are
+    never evaluated (locals never are), and nothing in sqlglot or its tests reads a
+    function's __annotations__. Class- and module-level annotations stay: dataclasses,
+    NamedTuples and TypedDicts read them."""
+    import copy
+
+    tree = copy.deepcopy(tree)
+
+    class Strip(ast.NodeTransformer):
+        depth = 0
+
+        def _func(self, node):
+            for a in node.args.posonlyargs + node.args.args + node.args.kwonlyargs:
+                a.annotation = None
+            for a in (node.args.vararg, node.args.kwarg):
+                if a is not None:
+                    a.annotation = None
+            if not isinstance(node, ast.Lambda):
+                node.returns = None
+            self.depth += 1
+            self.generic_visit(node)
+            self.depth -= 1
+            return node
+
+        visit_FunctionDef = visit_AsyncFunctionDef = visit_Lambda = _func
+
+        def visit_ClassDef(self, node):
+            saved, self.depth = self.depth, 0  # a class body inside a function is class level
+            self.generic_visit(node)
+            self.depth = saved
+            return node
+
+        def visit_AnnAssign(self, node):
+            self.generic_visit(node)
+            if self.depth:
+                node.annotation = ast.Constant(None)
+            return node
+
+    return ast.dump(Strip().visit(tree))
+
+
+def narrow_by_annotations(c: Commit) -> None:
+    """A file whose only change is in function annotations keeps no test for that file
+    (tests that read the source as data excepted, via narrow_file)."""
+    for path, new in c.overlay.items():
+        if not c.file_sel.get(path):
+            continue
+        try:
+            old_tree, new_tree = ast.parse(c.old[path]), ast.parse(new)
+        except SyntaxError:
+            continue
+        if not (_future_annotations(old_tree) and _future_annotations(new_tree)):
+            continue
+        # Cheap gate: every changed line lies in a function header or an annotated
+        # assignment, the only places the full comparison below can accept.
+        allowed: set[int] = set()
+        for node in ast.walk(old_tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                allowed.update(range(node.lineno, node.body[0].lineno))
+            elif isinstance(node, ast.AnnAssign):
+                allowed.update(range(node.lineno, node.end_lineno + 1))
+        if not c.changed.get(path) or not c.changed[path] <= allowed:
+            continue
+        if ast.dump(old_tree) == ast.dump(new_tree):
+            continue
+        if _strip_function_annotations(old_tree) == _strip_function_annotations(new_tree):
+            narrow_file(c, path, 0, "annotations-only")
+
+
 # ------------------------------------------------------------ TPC-DS entries
 
 USE_TPCDS = os.environ.get("BR_USE_TPCDS", "1") == "1"
@@ -1189,6 +1272,13 @@ def main() -> None:
             except Exception as error:
                 c.sel, c.file_sel = saved
                 log(f"{c.id}: arg_types narrowing failed ({error!r})")
+        if USE_ANNOTATIONS and c.sel and c.file_sel:
+            saved = (c.sel, dict(c.file_sel))
+            try:
+                narrow_by_annotations(c)
+            except Exception as error:
+                c.sel, c.file_sel = saved
+                log(f"{c.id}: annotation narrowing failed ({error!r})")
         if USE_FIXTURES and c.sel and c.fixtures:
             saved = (c.sel, dict(c.file_sel))
             try:

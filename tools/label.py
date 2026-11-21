@@ -97,7 +97,7 @@ def main():
     slots = queue.Queue()
     per = 14 // a.jobs
     for j in range(a.jobs):
-        slots.put(f"{j*per}-{j*per+per-1}" if a.jobs > 1 else "")
+        slots.put(os.environ.get("BR_CPUSET") or (f"{j*per}-{j*per+per-1}" if a.jobs > 1 else ""))
 
     def job(p):
         s = slots.get()

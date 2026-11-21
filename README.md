@@ -71,6 +71,10 @@ before:
 - **Only True/False values in one `arg_types` literal changed**: keep the tests
   that validated an instance of that class (or a subclass, or a class that copies
   its `arg_types`) with that argument missing.
+- **Only function annotations changed** (parameters, returns, local variables, in a
+  module with `from __future__ import annotations`): nothing. They are never
+  evaluated and nothing reads a function's `__annotations__`; class- and
+  module-level annotations are not covered (dataclasses read them).
 - **A SQL fixture changed**: keep the tests that read a part of the file that
   differs (a file the helpers can no longer load keeps every test that opens it).
 - Tests that open the changed source file as data are always kept.
