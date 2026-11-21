@@ -593,6 +593,101 @@ def _expr_class_of(path: str, prefix: str) -> set[str]:
     return keys
 
 
+_MODATTR: dict = {}
+
+
+def _modattr():
+    """map/modattr.json.gz: per sqlglot module and name, the tests that fetched that
+    name from the module object (from-import, attribute, getattr, unpickling)."""
+    if "raw" not in _MODATTR:
+        p = MAP.parent / "modattr.json.gz"
+        _MODATTR["raw"] = json.loads(gzip.decompress(p.read_bytes())) if p.exists() else None
+        _MODATTR["bits"] = {}
+    return _MODATTR["raw"]
+
+
+def _modattr_bits(module: str, name: str) -> int:
+    raw = _modattr()
+    i = raw["keys"].get(module, {}).get(name)
+    if i is None:
+        return 0
+    b = _MODATTR["bits"].get(i)
+    if b is None:
+        b = _MODATTR["bits"][i] = int(raw["sets"][i], 16)
+    return b
+
+
+def _star_importers(module: str) -> list[str]:
+    """Modules that run `from <module> import *` (their namespace copies its names)."""
+    out = []
+    for p in sorted((SRC / "sqlglot").rglob("__init__.py")):
+        text = p.read_text(encoding="utf-8")
+        if f"from {module} import *" in text:
+            rel = p.relative_to(SRC).parent
+            out.append(".".join(rel.parts))
+    return out
+
+
+def _gone_names_users(path: str, old_tree, gone: set[str], cov: CoverageMap) -> int | None:
+    """Tests that can notice module-level names disappearing from `path`: those that
+    fetched a name from the module (or from a package that star-imports it), and
+    those that ran a line naming it outside its own binding statement. None when
+    that is not enough: classes (namespace scans find them without fetching by
+    name), decorated functions, dunder names, and modules with __getattr__,
+    __all__ or globals() writes."""
+    if _modattr() is None or not path.startswith("sqlglot/") or not path.endswith(".py"):
+        return None
+    module = path[:-3].replace("/", ".")
+    if module.endswith(".__init__"):
+        module = module[: -len(".__init__")]
+    class_names = {k.rsplit(":", 1)[1].rsplit(".", 1)[-1] for k in static().cls}
+    for node in ast.walk(old_tree):
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) in ("globals", "vars"):
+            return None
+    binding: dict[str, ast.stmt] = {}
+    for st in old_tree.body:
+        if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)) and st.name == "__getattr__":
+            return None
+        if "__all__" in _targets(st) if isinstance(st, (ast.Assign, ast.AnnAssign, ast.AugAssign)) else False:
+            return None
+        names = set()
+        if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names = {st.name}
+        elif isinstance(st, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            names = set(_targets(st))
+        elif isinstance(st, (ast.Import, ast.ImportFrom)):
+            names = {(a.asname or a.name).split(".")[0] for a in st.names}
+        for n in names & gone:
+            binding[n] = st
+    sel = 0
+    stars = _star_importers(module)
+    for n in gone:
+        st = binding.get(n)
+        if st is None or n.startswith("__") or n in class_names or isinstance(st, ast.ClassDef):
+            return None
+        if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)) and st.decorator_list:
+            return None
+        sel |= _modattr_bits(module, n)
+        for p in stars:
+            sel |= _modattr_bits(p, n)
+        # Lines that resolve the name through this module's globals: the module itself
+        # and packages that copied its names with a star import. Code elsewhere
+        # reaches it by from-import or attribute, which the map records.
+        first = min([st.lineno] + [d.lineno for d in getattr(st, "decorator_list", [])])
+        pattern = re.compile(rf"\b{re.escape(n)}\b")
+        for file, skip in [(path, range(first, st.end_lineno + 1))] + [
+            (p.replace(".", "/") + "/__init__.py", ()) for p in stars
+        ]:
+            try:
+                lines = (SRC / file).read_text(encoding="utf-8").split("\n")
+            except OSError:
+                return None
+            for i, line in enumerate(lines, 1):
+                if i not in skip and pattern.search(line):
+                    sel |= cov.at_line(file, i)
+    return sel
+
+
 def module_level(path: str, old_tree, new_tree, cov: CoverageMap) -> tuple[int, list[str]]:
     import difflib
 
@@ -603,6 +698,9 @@ def module_level(path: str, old_tree, new_tree, cov: CoverageMap) -> tuple[int, 
     imp = cov.importers(path)
     gone = _module_names(old_tree) - _module_names(new_tree)
     if gone:
+        narrowed = _gone_names_users(path, old_tree, gone, cov)
+        if narrowed is not None:
+            return narrowed & imp, [f"module-name-removed(users) {','.join(sorted(gone))[:80]}"]
         # `from module import name` now fails at import time in every importer.
         return imp, [f"module-name-removed {','.join(sorted(gone))[:80]}"]
     sm = difflib.SequenceMatcher(None, [x[0] + x[1] for x in a], [x[0] + x[1] for x in b], autojunk=False)
