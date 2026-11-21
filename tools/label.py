@@ -40,6 +40,7 @@ def label(patch: Path, workers: int, cpuset: str = "") -> dict:
             env = dict(os.environ, BRLABEL_OUT=str(out / "r"), PYTHONPATH=f"{tree}:{ROOT/'tools'}",
                        SKIP_INTEGRATION="0", PYTHONDONTWRITEBYTECODE="1", PYTHON_CPU_COUNT="2")
             env.pop("VIRTUAL_ENV", None)
+            env["PATH"] = f"{ROOT / 'work/venv/bin'}:{env['PATH']}"  # tests run a bare `python`
             subprocess.run([str(ROOT / "work/venv/bin/python"), "-m", "pytest", "-p", "brlabel", "-p", "no:cacheprovider",
                             "-qq", "-n", str(workers), "--timeout", "300", "tests"], cwd=tree, env=env,
                            capture_output=True, text=True)

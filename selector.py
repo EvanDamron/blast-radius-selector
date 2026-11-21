@@ -29,8 +29,8 @@ MAP = Path(os.environ.get("BR_MAP", str(Path(__file__).resolve().parent / "map" 
 WORKER_COST = 2000  # milliseconds
 MAX_WORKERS = 8
 
-# Files whose edits change how pytest itself runs every test.
-PYTEST_CONFIG = {"pyproject.toml", "setup.cfg", "pytest.ini", "tox.ini", "conftest.py", "tests/conftest.py"}
+# Files pytest reads at startup: a broken or pytest-related edit reaches every test.
+PYTEST_CONFIG = {"pyproject.toml", "setup.cfg", "pytest.ini", "tox.ini"}
 
 
 def log(*args) -> None:
@@ -192,14 +192,27 @@ def parse_patch(text: str) -> list[FilePatch]:
     return files
 
 
-def apply_hunks(old: str, hunks) -> tuple[str, list[int], list[int]]:
-    """Return (new text, old line numbers removed, new line numbers added)."""
+def apply_hunks(old: str, hunks) -> tuple[str, list[int], list[int], list[int]]:
+    """Return (new text, old lines removed, new lines added, insertion anchors).
+
+    An anchor p marks a run of added lines with no removed line beside it,
+    inserted between old lines p and p + 1.
+    """
     old_lines = old.split("\n")
     out: list[str] = []
     removed: list[int] = []
     added: list[int] = []
+    anchors: list[int] = []
     pos = 0  # old lines consumed
     for old_start, old_len, body in hunks:
+        tags = [h[0] for h in body]
+        for k, tag in enumerate(tags):
+            if tag == "+" and (k == 0 or tags[k - 1] != "+"):
+                end = k
+                while end < len(tags) and tags[end] == "+":
+                    end += 1
+                if (k == 0 or tags[k - 1] != "-") and (end >= len(tags) or tags[end] != "-"):
+                    anchors.append(-1 - k)  # resolved below to an old line number
         start = max(old_start - 1 if old_len > 0 else old_start, pos)
         out.extend(old_lines[pos:start])
         pos = start
@@ -214,8 +227,17 @@ def apply_hunks(old: str, hunks) -> tuple[str, list[int], list[int]]:
             else:
                 out.append(text)
                 added.append(len(out))
+        # Resolve anchors of this hunk: old lines consumed before body index k.
+        consumed = old_start - 1 if old_len > 0 else old_start
+        resolved = []
+        for k, tag in enumerate(tags):
+            if -1 - k in anchors:
+                resolved.append(consumed)
+            if tag in " -":
+                consumed += 1
+        anchors = [a for a in anchors if a >= 0] + resolved
     out.extend(old_lines[pos:])
-    return "\n".join(out), removed, added
+    return "\n".join(out), removed, added, anchors
 
 
 # ---------------------------------------------------------------------- analysis
@@ -354,8 +376,11 @@ def sources() -> dict[str, str]:
     return _sources
 
 
-def readers(names: set[str], cov: CoverageMap, exclude: tuple[str, int, int]) -> int:
-    """Tests that ran any line mentioning one of the names (as code or in a string)."""
+def readers(names: set[str], cov: CoverageMap, exclude: tuple[str, int, int], tests_only: bool = False) -> int:
+    """Tests that ran any line mentioning one of the names (as code or in a string).
+
+    tests_only limits the search to test code: tests that inspect a table directly.
+    """
     names = {n for n in names if n}
     if not names:
         return 0
@@ -363,6 +388,8 @@ def readers(names: set[str], cov: CoverageMap, exclude: tuple[str, int, int]) ->
     bits = 0
     ex_path, ex_first, ex_last = exclude
     for rel, text in sources().items():
+        if tests_only and not rel.startswith("tests/"):
+            continue
         if not pat.search(text):
             continue
         for i, line in enumerate(text.split("\n"), 1):
@@ -519,7 +546,7 @@ def module_level(path: str, old_tree, new_tree, cov: CoverageMap) -> tuple[int, 
             span = (path, node.lineno, node.end_lineno) if o is not None else (path, 0, -1)
             exprs = _expr_class_of(path, prefix)
             if exprs and not set(name) & {"_sql_names", "key"}:
-                sel |= instantiators(exprs, cov)
+                sel |= instantiators(exprs, cov) | readers(set(name), cov, span, tests_only=True)
                 notes.append(f"expr-attr {where}")
                 continue
             ov = getattr(o, "value", None)
@@ -543,7 +570,7 @@ def module_level(path: str, old_tree, new_tree, cov: CoverageMap) -> tuple[int, 
                     else:
                         ok = False
                 if ok:
-                    sel |= bits & imp
+                    sel |= (bits | readers(set(name), cov, span, tests_only=True)) & imp
                     notes.append(f"dict-entries {where}")
                     continue
             sel |= readers(set(name), cov, span) & imp
@@ -558,7 +585,61 @@ def _expr_refs_any(nodes) -> bool:
     return any(node is not None and _expr_refs(node) for node in nodes)
 
 
-def analyze_python(path: str, old: str, new: str, removed, added, cov: CoverageMap) -> tuple[int, str]:
+GRAIN = os.environ.get("BR_GRAIN", "stmt")
+
+
+def _stmt_spans(func) -> list[tuple[int, int, int, int]]:
+    """(first, last, header_last, compound) for every statement in a function body,
+    not entering nested functions, classes or lambdas."""
+    out = []
+
+    def visit(stmts):
+        for st in stmts:
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                out.append((st.lineno, st.end_lineno, st.end_lineno, 0))
+                continue
+            children = []
+            for field in ("body", "orelse", "finalbody"):
+                v = getattr(st, field, None)
+                if isinstance(v, list) and v and isinstance(v[0], ast.stmt):
+                    children.append(v)
+            handlers = getattr(st, "handlers", None) or []
+            cases = getattr(st, "cases", None) or []
+            if children or handlers or cases:
+                first_child = min([c[0].lineno for c in children] + [h.lineno for h in handlers]
+                                  + [c.pattern.lineno for c in cases])
+                out.append((st.lineno, st.end_lineno, max(st.lineno, first_child - 1), 1))
+                for c in children:
+                    visit(c)
+                for h in handlers:
+                    out.append((h.lineno, h.end_lineno, max(h.lineno, h.body[0].lineno - 1), 1))
+                    visit(h.body)
+                for c in cases:
+                    out.append((c.pattern.lineno, c.end_lineno if hasattr(c, "end_lineno") else c.body[-1].end_lineno,
+                                max(c.pattern.lineno, c.body[0].lineno - 1), 1))
+                    visit(c.body)
+            else:
+                out.append((st.lineno, st.end_lineno, st.end_lineno, 0))
+
+    visit(func.body)
+    return out
+
+
+def _stmt_lines(spans, line: int) -> tuple[int, int] | None:
+    """Lines whose execution reveals that the code at `line` ran."""
+    best = None
+    for sp in spans:
+        if sp[0] <= line <= sp[1] and (best is None or sp[1] - sp[0] < best[1] - best[0]):
+            best = sp
+    if best is None:
+        return None
+    first, last, header_last, compound = best
+    if not compound or line <= header_last:
+        return first, header_last
+    return first, last  # e.g. an else: line, inside the statement but in no child
+
+
+def analyze_python(path: str, old: str, new: str, removed, added, cov: CoverageMap, anchors=()) -> tuple[int, str]:
     try:
         new_tree = ast.parse(new)
     except SyntaxError:
@@ -593,8 +674,32 @@ def analyze_python(path: str, old: str, new: str, removed, added, cov: CoverageM
             continue
         if o.own() == n.own():
             continue
-        s = cov.func_lines(path, o.first, o.last, include_body=o.kind == "def")
-        sel |= s
+        whole = cov.func_lines(path, o.first, o.last, include_body=o.kind == "def")
+        if GRAIN == "stmt" and o.kind == "def":
+            spans = _stmt_spans(o.node)
+            s = 0
+            ok = True
+            pts = [ln for ln in removed if o.first <= ln <= o.last]
+            for p in anchors:
+                if o.first - 1 <= p <= o.last:
+                    pts += [p, p + 1]
+            if not pts:
+                ok = False
+            for ln in pts:
+                rng = _stmt_lines(spans, ln) if o.first <= ln <= o.last else None
+                if rng is None:
+                    if ln in removed or not (o.first <= ln <= o.last):
+                        if ln in removed:
+                            ok = False
+                        continue
+                    ok = False
+                    continue
+                s |= cov.func_lines(path, rng[0], rng[1], include_body=True)
+            if ok:
+                sel |= s & whole if s else 0
+                kinds.append(f"stmt {q}")
+                continue
+        sel |= whole
         kinds.append(f"func {q}")
     if "" in candidates or module_changed:
         bits, notes = module_level(path, old_tree, new_tree, cov)
@@ -605,13 +710,52 @@ def analyze_python(path: str, old: str, new: str, removed, added, cov: CoverageM
     return sel, "; ".join(kinds)
 
 
+def _config_matters(path: str, fp: FilePatch) -> bool:
+    """Whether a pytest config file edit could change any test run."""
+    if fp.old_path is None or fp.new_path is None or fp.binary:
+        return True
+    src_file = SRC / path
+    if not src_file.exists():
+        return True
+    old = src_file.read_text(encoding="utf-8")
+    new, _, _, _ = apply_hunks(old, fp.hunks)
+    changed = [h[1:] for _, _, body in fp.hunks for h in body if h[:1] in "+-"]
+    if any("pytest" in line.lower() or "addopts" in line or "testpaths" in line for line in changed):
+        return True
+    try:
+        if path.endswith(".toml"):
+            import tomllib
+
+            tomllib.loads(new)
+        else:
+            import configparser
+
+            configparser.ConfigParser(interpolation=None, strict=False).read_string(new)
+    except Exception:
+        return True
+    # Does the change land inside a pytest section of the old or new file?
+    for text in (old, new):
+        section = ""
+        for line in text.split("\n"):
+            st = line.strip()
+            if st.startswith("["):
+                section = st
+            if "pytest" in section and line in changed:
+                return True
+    return False
+
+
 def analyze_file(fp: FilePatch, cov: CoverageMap) -> tuple[int, str]:
     old_path, new_path = fp.old_path, fp.new_path
     path = old_path or new_path
     if path is None:
         return 0, "empty"
-    if path in PYTEST_CONFIG or (new_path in PYTEST_CONFIG):
-        return (1 << cov.n) - 1, "pytest-config"
+    everything = (1 << cov.n) - 1
+    name = path.rsplit("/", 1)[-1]
+    if name == "conftest.py" or name == "sitecustomize.py" or name == "usercustomize.py":
+        return everything, "pytest-hook-file"
+    if path in PYTEST_CONFIG:
+        return (everything, "pytest-config") if _config_matters(path, fp) else (0, "config-other")
     if old_path is None:
         # A new file: nothing at the pinned commit reads it.
         return 0, "new-file"
@@ -627,8 +771,8 @@ def analyze_file(fp: FilePatch, cov: CoverageMap) -> tuple[int, str]:
     if not src_file.exists():
         return 0, "unknown-file"
     old = src_file.read_text(encoding="utf-8")
-    new, removed, added = apply_hunks(old, fp.hunks)
-    sel, kind = analyze_python(path, old, new, removed, added, cov)
+    new, removed, added, anchors = apply_hunks(old, fp.hunks)
+    sel, kind = analyze_python(path, old, new, removed, added, cov, anchors)
     return sel | cov.openers(path), kind
 
 

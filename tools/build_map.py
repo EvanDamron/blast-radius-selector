@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Fold per-test traces (work/trace/<number>/<pid>.json) into map/cov.json.gz.
+"""Fold per-test traces (TRACE_DIR/<number>/<pid>.json, any number of dirs, unioned)
+into map/cov.json.gz.
 
 Format: {"n": N, "sets": [hex bitset, ...],
          "lines": {relpath: {line: set_index}},   # lines run by function code
@@ -15,7 +16,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-trace = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "work" / "trace"
+traces = [Path(a) for a in sys.argv[1:]] or [ROOT / "work" / "trace"]
 tests = json.loads((ROOT / "starter/sample/tests.json").read_text())["tests"]
 N = len(tests)
 
@@ -26,11 +27,14 @@ open_bits: dict = {}
 missing = []
 for t in tests:
     n = t["number"]
-    d = trace / str(n)
-    rc = trace / f"{n}.rc"
-    files = list(d.glob("*.json")) if d.exists() else []
-    if not files or not rc.exists() or rc.read_text().strip() != "0":
-        missing.append((n, t["id"], rc.read_text() if rc.exists() else None, len(files)))
+    files = []
+    for trace in traces:
+        d = trace / str(n)
+        rc = trace / f"{n}.rc"
+        got = list(d.glob("*.json")) if d.exists() else []
+        files += got
+        if not got or not rc.exists() or rc.read_text().strip() != "0":
+            missing.append((n, t["id"], str(trace), rc.read_text() if rc.exists() else None, len(got)))
     bit = 1 << n
     for f in files:
         try:
