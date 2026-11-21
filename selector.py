@@ -15,6 +15,7 @@ importer. Any other file selects the tests that opened it.
 from __future__ import annotations
 
 import ast
+import bisect
 import gzip
 import json
 import os
@@ -276,13 +277,44 @@ class Scope:
         return sdump(self.node.body)
 
 
-def scopes(tree: ast.Module) -> list[Scope]:
-    """Every function and lambda, named by its position among classes and functions."""
+_SCOPE_WORDS = re.compile(r"\b(?:lambda|def|class)\b")
+
+
+def scopes(tree: ast.Module, text: str | None = None) -> list[Scope]:
+    """Every function and lambda, named by its position among classes and functions.
+
+    With the source text, subtrees spanning no line that mentions def, lambda or
+    class are skipped: they hold no scope, so the numbering is unchanged.
+    """
     out: list[Scope] = []
     counters: dict[str, int] = {}
+    marks: list[int] | None = None
+    if text is not None:
+        starts = _line_starts(text)
+        marks = sorted({bisect.bisect_right(starts, m.start()) for m in _SCOPE_WORDS.finditer(text)})
+
+    AST = ast.AST
+
+    def children(node):
+        for field in node._fields:
+            v = getattr(node, field, None)
+            if isinstance(v, list):
+                for x in v:
+                    if isinstance(x, AST):
+                        yield x
+            elif isinstance(v, AST):
+                yield v
 
     def visit(node, qual):
-        for child in ast.iter_child_nodes(node):
+        for child in children(node):
+            if isinstance(child, (ast.expr_context, ast.operator, ast.cmpop, ast.boolop, ast.unaryop)):
+                continue
+            if marks is not None:
+                lo = getattr(child, "lineno", None)
+                if lo is not None:
+                    k = bisect.bisect_left(marks, lo)
+                    if k == len(marks) or marks[k] > child.end_lineno:
+                        continue
             if isinstance(child, _FUNC):
                 q = f"{qual}.{child.name}"
                 k = counters.get(q, 0)
@@ -401,11 +433,20 @@ def readers(names: set[str], cov: CoverageMap, exclude: tuple[str, int, int], te
     for rel, text in sources().items():
         if tests_only and not rel.startswith("tests/"):
             continue
-        if not pat.search(text):
+        if not any(n in text for n in names) or not pat.search(text):
             continue
-        for i, line in enumerate(text.split("\n"), 1):
-            if not pat.search(line) or (rel == ex_path and ex_first <= i <= ex_last):
+        starts = None
+        seen_lines = set()
+        for hit in pat.finditer(text):
+            if starts is None:
+                starts = _line_starts(text, rel)
+            i = bisect.bisect_right(starts, hit.start())  # 1-based line number
+            if i in seen_lines:
                 continue
+            seen_lines.add(i)
+            if rel == ex_path and ex_first <= i <= ex_last:
+                continue
+            line = text[starts[i - 1]: starts[i] - 1 if i < len(starts) else len(text)]
             d = definition.match(line)
             if d and not pat.search(d.group(1) or ""):
                 continue
@@ -427,6 +468,26 @@ def readers(names: set[str], cov: CoverageMap, exclude: tuple[str, int, int], te
     if split_family is not None:
         return bits, other
     return bits
+
+
+_starts_cache: dict[str, list[int]] = {}
+
+
+def _line_starts(text: str, cache_key: str | None = None) -> list[int]:
+    """Offsets where each line begins; cache_key caches it (for the pinned sources)."""
+    if cache_key is not None:
+        got = _starts_cache.get(cache_key)
+        if got is not None:
+            return got
+    got = [0]
+    find = text.find
+    k = find("\n")
+    while k != -1:
+        got.append(k + 1)
+        k = find("\n", k + 1)
+    if cache_key is not None:
+        _starts_cache[cache_key] = got
+    return got
 
 
 def _targets(st) -> set[str]:
@@ -725,8 +786,8 @@ def analyze_python(path: str, old: str, new: str, removed, added, cov: CoverageM
     except SyntaxError:
         return cov.importers(path), "old-unparsable"
 
-    old_scopes = scopes(old_tree)
-    new_scopes = scopes(new_tree)
+    old_scopes = scopes(old_tree, old)
+    new_scopes = scopes(new_tree, new)
     old_by = {sc.qual: sc for sc in old_scopes}
     new_by = {sc.qual: sc for sc in new_scopes}
 
