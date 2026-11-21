@@ -80,7 +80,32 @@ if _dir:
             s.add(line)
         return _DISABLE
 
+    _listed = set()
+
     def _audit(event, args):
+        if event in ("os.listdir", "os.scandir", "glob.glob") and args:
+            p = args[0]
+            if isinstance(p, bytes):
+                p = p.decode(errors="replace")
+            if isinstance(p, str):
+                if not p.startswith("/"):
+                    p = os.path.join(os.getcwd(), p)
+                p = os.path.normpath(p)
+                if p.startswith(_PREFIX) or p + "/" == _PREFIX:
+                    # Only listings asked for by sqlglot or test code, not by the
+                    # import system or pytest's own collection.
+                    f = _getframe(1)
+                    depth = 0
+                    while f is not None and depth < 25:
+                        fn = f.f_code.co_filename
+                        if fn.startswith(_PREFIX):
+                            _listed.add(p)
+                            break
+                        if "importlib" in fn or "_pytest" in fn or "pluggy" in fn:
+                            break
+                        f = f.f_back
+                        depth += 1
+            return
         if event == "open" and args and isinstance(args[0], str):
             p = args[0]
             if not p.startswith("/"):
@@ -100,7 +125,8 @@ if _dir:
         with open(os.path.join(_dir, f"{os.getpid()}.json"), "w") as fh:
             json.dump({"lines": {rel(k): sorted(v) for k, v in _lines.items()},
                        "opened": sorted(p[_PL:] for p in _opened),
-                       "classes": sorted(_classes)}, fh)
+                       "classes": sorted(_classes),
+                       "listed": sorted(p[_PL:] for p in _listed)}, fh)
 
     _mon.use_tool_id(_TOOL, "brtrace")
     _mon.register_callback(_TOOL, _mon.events.LINE, _line)

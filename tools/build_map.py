@@ -6,7 +6,8 @@ Format: {"n": N, "sets": [hex bitset, ...],
          "lines": {relpath: {line: set_index}},   # lines run by function code
          "body": {relpath: {line: set_index}},    # lines run by module/class-body code
          "opened": {relpath: set_index},
-         "classes": {"module:Qualname": set_index}}  # expression classes instantiated
+         "classes": {"module:Qualname": set_index},  # sqlglot classes instantiated
+         "listed": {reldir: set_index}}  # directories listed (os.listdir/scandir/glob)
 A bitset has bit t set when test number t executed that line / opened that file.
 Paths are relative to the sqlglot checkout root.
 """
@@ -23,6 +24,7 @@ N = len(tests)
 line_bits: dict = {}
 body_bits: dict = {}
 class_bits: dict = {}
+list_bits: dict = {}
 open_bits: dict = {}
 missing = []
 for t in tests:
@@ -48,6 +50,8 @@ for t in tests:
             m = (body_bits if body else line_bits).setdefault(rel, {})
             for ln in lines:
                 m[ln] = m.get(ln, 0) | bit
+        for path in data.get("listed", []):
+            list_bits[path] = list_bits.get(path, 0) | bit
         for name in data.get("classes", []):
             class_bits[name] = class_bits.get(name, 0) | bit
         for path in data["opened"]:
@@ -72,6 +76,7 @@ out = {
     "body": {f: {str(ln): sid(b) for ln, b in sorted(m.items())} for f, m in sorted(body_bits.items())},
     "opened": {f: sid(b) for f, b in sorted(open_bits.items())},
     "classes": {c: sid(b) for c, b in sorted(class_bits.items())},
+    "listed": {d: sid(b) for d, b in sorted(list_bits.items())},
 }
 out["sets"] = sets
 blob = json.dumps(out, separators=(",", ":")).encode()

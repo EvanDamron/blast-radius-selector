@@ -52,6 +52,7 @@ class CoverageMap:
         self.body = raw["body"]
         self.opened = raw["opened"]
         self.classes = raw.get("classes", {})
+        self.listed = raw.get("listed", {})
         self._file_union: dict[str, int] = {}
 
     def bits(self, index: int) -> int:
@@ -85,6 +86,11 @@ class CoverageMap:
                 if i is not None:
                     out |= self.bits(i)
         return out
+
+    def listers(self, directory: str) -> int:
+        """Tests whose own code listed the directory (os.listdir, scandir, glob)."""
+        i = self.listed.get(directory)
+        return self.bits(i) if i is not None else 0
 
     def class_users(self, key: str) -> int:
         i = self.classes.get(key)
@@ -894,14 +900,17 @@ def analyze_file(fp: FilePatch, cov: CoverageMap) -> tuple[int, str]:
     if path in PYTEST_CONFIG:
         return (everything, "pytest-config") if _config_matters(path, fp) else (0, "config-other")
     if old_path is None:
-        # A new file: nothing at the pinned commit reads it.
-        return 0, "new-file"
+        # A new file: only code that lists its directory can find it.
+        return cov.listers(new_path.rsplit("/", 1)[0] if "/" in new_path else ""), "new-file"
     sel = 0
     if new_path != old_path:
         # Deleted or renamed: everything that used the old path loses it.
+        listed = cov.listers(old_path.rsplit("/", 1)[0] if "/" in old_path else "")
+        if new_path:
+            listed |= cov.listers(new_path.rsplit("/", 1)[0] if "/" in new_path else "")
         if old_path.endswith(".py"):
-            return cov.importers(old_path) | cov.openers(old_path), "deleted-or-renamed"
-        return cov.openers(old_path), "deleted-or-renamed"
+            return cov.importers(old_path) | cov.openers(old_path) | listed, "deleted-or-renamed"
+        return cov.openers(old_path) | listed, "deleted-or-renamed"
     if fp.binary or not path.endswith(".py"):
         return cov.openers(path), "data-file"
     src_file = SRC / path
