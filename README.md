@@ -24,6 +24,16 @@ The maps in `map/` were built once from the pinned commit:
   looked up or tested for membership, and whether it read the dict wholesale. For
   every class-level name, they record whether a test's reads resolved to that
   class's definition.
+- `defaults.json.gz`, `argtypes.json.gz` (built by `tools/defaults/`): each test
+  ran under a call recorder. For every function parameter with a literal default,
+  they record the tests in which some call received a value identical to the
+  default (any other value proves the caller passed the argument). For every
+  validation of an expression (`Expression.error_messages`, the only reader of
+  `arg_types` values), they record which arguments were missing.
+- `fixtures.json.gz` (built by `tools/fixtures/`): each test that opens a SQL
+  fixture ran once per part of that file (metadata, input SQL, expected SQL, or
+  whole entries, as `tests/helpers.py` yields them), with that part replaced by an
+  object that fails on first use. A test that passes never reads that part.
 
 At run time `selector.py` applies each patch to the pinned source and compares
 the old and new ASTs, one scope at a time:
@@ -56,6 +66,13 @@ before:
 - **Only one class-level assignment changed**: keep the tests whose reads
   resolved to that class (not applied to names that also occur as strings, enums,
   dataclasses or decorated classes).
+- **Only literal default values changed**: keep the tests in which a call may
+  have used the old default.
+- **Only True/False values in one `arg_types` literal changed**: keep the tests
+  that validated an instance of that class (or a subclass, or a class that copies
+  its `arg_types`) with that argument missing.
+- **A SQL fixture changed**: keep the tests that read a part of the file that
+  differs (a file the helpers can no longer load keeps every test that opens it).
 - Tests that open the changed source file as data are always kept.
 
 The selected tests are split by longest-processing-time first, for whichever

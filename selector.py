@@ -87,6 +87,7 @@ class Commit:
         self.kinds: list[str] = []
         self.overlay: dict[str, str] = {}
         self.old: dict[str, str] = {}
+        self.fixtures: dict[str, tuple[str, str]] = {}  # per changed SQL fixture: (old, new) text
         self.executable = True  # every changed file is an existing Python file
         self.note = ""
 
@@ -117,6 +118,21 @@ def analyze(cid: str, text: str, cov, valid: int) -> Commit:
             c.sel |= s
             path = fp.old_path or fp.new_path
             c.kinds.append(f"{path}:{kind}")
+            if (
+                path is not None
+                and fp.old_path == fp.new_path
+                and not fp.binary
+                and path.startswith("tests/fixtures/")
+                and path.endswith(".sql")
+                and kind.startswith("data-file")
+                and (SRC / path).exists()
+            ):
+                old = (SRC / path).read_text(encoding="utf-8")
+                new, _, _, _ = base.apply_hunks(old, fp.hunks)
+                c.fixtures[path] = (old, new)
+                c.file_sel[path] = c.file_sel.get(path, 0) | (s & valid)
+                c.executable = False
+                continue
             if (
                 path is None
                 or fp.old_path != fp.new_path
@@ -474,6 +490,266 @@ def narrow_by_reads(c: Commit) -> None:
             narrow_file(c, path, affected, how)
 
 
+# ------------------------------------------------------------ default values
+
+USE_DEFAULTS = os.environ.get("BR_USE_DEFAULTS", "1") == "1"
+USE_FIXTURES = os.environ.get("BR_USE_FIXTURES", "1") == "1"
+DEFAULTS_MAP = HERE / "map" / "defaults.json.gz"
+_FUNC = (ast.FunctionDef, ast.AsyncFunctionDef)
+
+
+def _literal(node) -> tuple[bool, object]:
+    """(True, value) for a default the recorder tracked (tools/defaults/build_table.py)."""
+    if isinstance(node, ast.Constant) and type(node.value) in (str, int, float, bool, type(None)):
+        return True, node.value
+    if (isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub)
+            and isinstance(node.operand, ast.Constant) and type(node.operand.value) in (int, float)):
+        return True, -node.operand.value
+    return False, None
+
+
+def _function_defaults(tree: ast.Module) -> tuple[str, dict]:
+    """The module dumped with every literal default blanked, and {qualname: [{param:
+    (type, value)}, ...]} for those defaults, one dict per definition of the qualname."""
+    found: dict = {}
+
+    def walk(body, qual):
+        for node in body:
+            if isinstance(node, _FUNC):
+                q = qual + node.name
+                a = node.args
+                pos = a.posonlyargs + a.args
+                pairs = list(zip(pos[len(pos) - len(a.defaults):], a.defaults))
+                pairs += [(x, d) for x, d in zip(a.kwonlyargs, a.kw_defaults) if d is not None]
+                lits = {}
+                for arg, d in pairs:
+                    ok, v = _literal(d)
+                    if ok:
+                        lits[arg.arg] = (type(v).__name__, v)
+                found.setdefault(q, []).append(lits)
+                walk(node.body, q + ".<locals>.")
+            elif isinstance(node, ast.ClassDef):
+                walk(node.body, qual + node.name + ".")
+            else:
+                for field in ("body", "orelse", "finalbody", "handlers"):
+                    sub = getattr(node, field, None)
+                    if isinstance(sub, list):
+                        walk(sub, qual)
+
+    walk(tree.body, "")
+
+    class Blank(ast.NodeTransformer):
+        def visit_arguments(self, node):
+            node.defaults = [ast.Constant("<default>") if _literal(d)[0] else d for d in node.defaults]
+            node.kw_defaults = [
+                ast.Constant("<default>") if d is not None and _literal(d)[0] else d for d in node.kw_defaults
+            ]
+            self.generic_visit(node)
+            return node
+
+    import copy
+
+    return ast.dump(Blank().visit(copy.deepcopy(tree))), found
+
+
+def narrow_by_defaults(c: Commit) -> None:
+    """A file whose only change is literal default values keeps the tests in which some
+    call of that function may have used the default: a call that received any other
+    value passed the argument itself (map/defaults.json.gz)."""
+    m = _map(DEFAULTS_MAP)
+    if m is None:
+        return
+    for path, new in c.overlay.items():
+        # Only a function-header edit can be a default change (base selector evidence).
+        if not c.file_sel.get(path) or not any(k.startswith(f"{path}:") and "def-header" in k for k in c.kinds):
+            continue
+        try:
+            old_dump, old_defs = _function_defaults(ast.parse(c.old[path]))
+            new_dump, new_defs = _function_defaults(ast.parse(new))
+        except SyntaxError:
+            continue
+        if old_dump != new_dump:
+            continue
+        keep = 0
+        changed = 0
+        recorded = m.raw["keys"].get(path, {})
+        for qual, old_lits in old_defs.items():
+            new_lits = new_defs.get(qual)
+            if old_lits == new_lits:
+                continue
+            if new_lits is None or len(old_lits) != 1 or len(new_lits) != 1 or set(old_lits[0]) != set(new_lits[0]):
+                # A qualname defined twice shares one record: do not guess which changed.
+                keep = None
+                break
+            old_lits, new_lits = old_lits[0], new_lits[0]
+            for param, value in old_lits.items():
+                if new_lits[param] != value:
+                    changed += 1
+                    keep |= m.bits(recorded.get(qual, {}).get(param))
+        if keep is not None and changed:
+            narrow_file(c, path, keep, "defaults")
+
+
+# ------------------------------------------------------------ arg_types values
+
+ARGTYPES_MAP = HERE / "map" / "argtypes.json.gz"
+
+
+def narrow_by_arg_types(c: Commit) -> None:
+    """A file whose only change is the values of entries in one class's arg_types
+    literal keeps the tests that validated an instance of an affected class with that
+    argument missing. Those values are read only through required_args, which only
+    Expression.error_messages consults (map/argtypes.json.gz)."""
+    m = _map(ARGTYPES_MAP)
+    if m is None:
+        return
+    for path, new in c.overlay.items():
+        if not path.startswith("sqlglot/") or not c.file_sel.get(path) or c.tag.get(path) != "expr-attr":
+            continue
+        try:
+            change = class_level_change(ast.parse(c.old[path]), ast.parse(new))
+        except SyntaxError:
+            continue
+        if change is None:
+            continue
+        qual, a, b, cls = change
+        name, old = _assign(a)
+        name2, new_value = _assign(b)
+        if name != "arg_types" or name2 != "arg_types" or not isinstance(old, ast.Dict) or not isinstance(new_value, ast.Dict):
+            continue
+        if sum(1 for st in cls.body if _assign(st)[0] == "arg_types") != 1 or len(old.keys) != len(new_value.keys):
+            continue
+        changed = set()
+        ok = True
+        for ko, kn, vo, vn in zip(old.keys, new_value.keys, old.values, new_value.values):
+            if ko is None or kn is None or ast.dump(ko) != ast.dump(kn):
+                ok = ok and ko is None and kn is None and ast.dump(vo) == ast.dump(vn)
+                continue
+            if not isinstance(ko, ast.Constant) or not isinstance(ko.value, str):
+                ok = False
+            elif ast.dump(vo) != ast.dump(vn):
+                if not (isinstance(vo, ast.Constant) and isinstance(vn, ast.Constant)):
+                    ok = False
+                elif bool(vo.value) != bool(vn.value):
+                    changed.add(ko.value)
+        if not ok:
+            continue
+        # The class and every class whose arg_types derive from it.
+        module = path[:-3].replace("/", ".")
+        if module.endswith(".__init__"):
+            module = module[: -len(".__init__")]
+        start = f"{module}:{'.'.join(qual)}"
+        expr = base.static().expr
+        spreads = m.raw.get("spreads", {})
+        affected, todo = set(), [start]
+        while todo:
+            k = todo.pop()
+            if k in affected:
+                continue
+            affected.add(k)
+            todo += expr.get(k, [None, []])[1]
+            todo += spreads.get(k, [])
+        if start not in expr:
+            continue  # not an expression class: arg_types means something else here
+        keep = 0
+        for k in affected:
+            rec = m.raw["keys"].get(k, {})
+            for arg in changed:
+                keep |= m.bits(rec.get(arg))
+        narrow_file(c, path, keep, "argtypes")
+
+
+# ------------------------------------------------------------ fixture parts
+
+FIXTURES_MAP = HERE / "map" / "fixtures.json.gz"
+
+
+class _LoaderError(Exception):
+    pass
+
+
+def _filter_comments(s: str) -> str:
+    # tests/helpers.py at the pinned commit
+    return "\n".join([line for line in s.splitlines() if line and not line.startswith("--")])
+
+
+def _fixture_pairs(text: str):
+    """What load_sql_fixture_pairs yields for this text, or _LoaderError if it raises."""
+    try:
+        statements = _filter_comments(text).split(";")
+        out = []
+        for i in range(0, len(statements), 2):
+            if i + 1 < len(statements):
+                sql = statements[i].strip()
+                meta = {}
+                lines = sql.split("\n")
+                j = 0
+                while lines[j].startswith("#"):
+                    key, val = lines[j].split(":", maxsplit=1)
+                    meta[key.lstrip("#").strip()] = val.strip()
+                    j += 1
+                out.append((meta, "\n".join(lines[j:]), statements[i + 1].strip()))
+        return out
+    except Exception as error:
+        raise _LoaderError() from error
+
+
+def _fixture_entries(text: str) -> list[str]:
+    """What load_sql_fixtures yields for this text."""
+    out, lines = [], []
+    for line in _filter_comments(text).splitlines():
+        lines.append(line)
+        if not line.startswith("#"):
+            out.append("\n".join(lines))
+            lines.clear()
+    return out
+
+
+def _changed_parts(old: str, new: str) -> set[str] | None:
+    """The parts of a fixture file (as the helpers yield them) that differ, or None
+    when the new text makes a helper raise (every test that loads it fails)."""
+    parts = set()
+    try:
+        a = _fixture_pairs(old)
+    except _LoaderError:
+        a = None  # no passing test loads it this way at the pinned commit
+    if a is not None:
+        try:
+            b = _fixture_pairs(new)
+        except _LoaderError:
+            return None
+        if len(a) != len(b):
+            parts |= {"meta", "sql", "expected"}
+        else:
+            for x, y in zip(a, b):
+                for kind, u, v in zip(("meta", "sql", "expected"), x, y):
+                    if u != v:
+                        parts.add(kind)
+    if _fixture_entries(old) != _fixture_entries(new):
+        parts.add("entry")
+    return parts
+
+
+def narrow_by_fixture_reads(c: Commit) -> None:
+    """A changed SQL fixture keeps the tests that read a changed part of it (records:
+    map/fixtures.json.gz), plus any test that opens it other than through the helpers."""
+    raw = _maps.get("fixtures")
+    if raw is None:
+        raw = _maps["fixtures"] = json.loads(gzip.decompress(FIXTURES_MAP.read_bytes())) if FIXTURES_MAP.exists() else {}
+    for path, (old, new) in c.fixtures.items():
+        rec = raw.get(path)
+        if rec is None or not c.file_sel.get(path):
+            continue
+        parts = _changed_parts(old, new)
+        if parts is None:
+            continue
+        keep = 0
+        for kind in parts | {"direct"}:
+            for n in rec.get(kind, []):
+                keep |= 1 << n
+        narrow_file(c, path, keep, "fixture-parts")
+
+
 # ------------------------------------------------------------------- execution
 
 USE_WARM = os.environ.get("BR_USE_WARM", "0") == "1"
@@ -811,6 +1087,27 @@ def main() -> None:
             except Exception as error:
                 c.sel, c.file_sel = saved
                 log(f"{c.id}: read narrowing failed ({error!r})")
+        if USE_DEFAULTS and c.sel and c.file_sel:
+            saved = (c.sel, dict(c.file_sel))
+            try:
+                narrow_by_defaults(c)
+            except Exception as error:
+                c.sel, c.file_sel = saved
+                log(f"{c.id}: default narrowing failed ({error!r})")
+        if USE_DEFAULTS and c.sel and c.file_sel:
+            saved = (c.sel, dict(c.file_sel))
+            try:
+                narrow_by_arg_types(c)
+            except Exception as error:
+                c.sel, c.file_sel = saved
+                log(f"{c.id}: arg_types narrowing failed ({error!r})")
+        if USE_FIXTURES and c.sel and c.fixtures:
+            saved = (c.sel, dict(c.file_sel))
+            try:
+                narrow_by_fixture_reads(c)
+            except Exception as error:
+                c.sel, c.file_sel = saved
+                log(f"{c.id}: fixture narrowing failed ({error!r})")
         commits.append(c)
 
     final: dict[str, list[int]] = {}

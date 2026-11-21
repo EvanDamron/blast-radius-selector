@@ -28,7 +28,7 @@ score = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(score)
 
 
-def run(dataset: Path, selector: Path, verbose: bool):
+def run(dataset: Path, selector: Path, verbose: bool, dump=None):
     answers = json.loads((dataset / "answers.json").read_text())["commits"]
     answers = {c: v for c, v in answers.items() if "failing" in v and "error" not in v and "incomplete" not in v}
     kinds = {}
@@ -74,6 +74,12 @@ def run(dataset: Path, selector: Path, verbose: bool):
             fs = sorted(fail, key=lambda t: -dur[t])
             oracle = min(max(dur[fs[0]], sum(dur[t] for t in fs) / k) + 2000 * k for k in range(1, 9))
         rows.append((d["commit"], cost, missed, len(sel), oracle, kinds.get(d["commit"], answers[d["commit"]].get("kind", "?"))))
+    if dump:
+        sels = {json.loads(l)["commit"]: sorted({t for w in json.loads(l)["workers"] for t in w})
+                for l in p.stdout.decode().splitlines()}
+        (dump / f"{dataset.name}.json").write_text(json.dumps(
+            {c: {"sel": sels[c], "failing": answers[c]["failing"], "kind": kinds.get(c, answers[c].get("kind", "?")),
+                 "log": stderr.get(c, "")} for c in sels}))
     sim = ev["simulated_milliseconds"] / 1000
     n = len(rows)
     print(f"{dataset.name}: n={n} simulated={sim:.1f}s misses={len(ev['missed_commits'])} cpu={cpu:.2f}s "
@@ -101,10 +107,11 @@ def main():
     ap.add_argument("datasets", nargs="*")
     ap.add_argument("--verbose", "-v", action="store_true")
     ap.add_argument("--selector", default=str(ROOT / "selector.py"))
+    ap.add_argument("--dump", type=Path, help="write each set's selections to DUMP/<set>.json")
     a = ap.parse_args()
     ds = a.datasets or [str(ROOT / "starter/sample")]
     for d in ds:
-        run(Path(d), Path(a.selector), a.verbose)
+        run(Path(d), Path(a.selector), a.verbose, a.dump)
 
 
 if __name__ == "__main__":

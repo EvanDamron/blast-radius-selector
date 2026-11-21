@@ -23,7 +23,7 @@ def run(t):
     if os.path.exists(d + ".rc"):
         return t["number"], "cached"
     os.makedirs(d, exist_ok=True)
-    env = dict(os.environ, BRTRACE_DIR=os.path.abspath(d), PYTHONPATH=f"{src}:{tools}/trace",
+    env = dict(os.environ, BRTRACE_DIR=os.path.abspath(d), PYTHONPATH=f"{src}:" + os.environ.get("BR_HOOK_DIR", f"{tools}/trace"),
                BRTRACE_PREFIX=src + "/", SKIP_INTEGRATION="0", PYTHON_CPU_COUNT="2", PYTHONDONTWRITEBYTECODE="1")
     r = subprocess.run([sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-qq", "-x",
                         "-p", "no:xdist", t["id"]], env=env, capture_output=True, text=True, cwd=src)
