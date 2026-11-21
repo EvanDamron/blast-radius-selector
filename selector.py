@@ -354,6 +354,7 @@ class Static:
         self.expr: dict[str, list] = raw["expr"]
         self.expr_by_name: dict[str, list] = raw["expr_by_name"]
         self.expr_by_key: dict[str, list] = raw["expr_by_key"]
+        self.cls: dict[str, list] = raw.get("cls", {})
 
 
 _static: Static | None = None
@@ -377,14 +378,20 @@ def sources() -> dict[str, str]:
     return _sources
 
 
-def readers(names: set[str], cov: CoverageMap, exclude: tuple[str, int, int], tests_only: bool = False) -> int:
+def readers(names: set[str], cov: CoverageMap, exclude: tuple[str, int, int], tests_only: bool = False,
+            split_family: set[str] | None = None):
     """Tests that ran any line mentioning one of the names (as code or in a string).
 
     tests_only limits the search to test code: tests that inspect a table directly.
+    split_family (the files of a dialect family) returns (instance_bits, other_bits):
+    instance_bits are lines that reach the name through a lowercase receiver
+    (self.X, self.dialect.X, klass.X) or as a bare name inside the family's files;
+    only an instance or class of the family can carry the edited value there.
     """
     names = {n for n in names if n}
     if not names:
-        return 0
+        return (0, 0) if split_family is not None else 0
+    other = 0
     alt = "|".join(sorted(map(re.escape, names)))
     pat = re.compile(r"\b(?:" + alt + r")\b")
     # `NAME = value` or `NAME: annotation` defines the name; only the value can read it.
@@ -402,7 +409,23 @@ def readers(names: set[str], cov: CoverageMap, exclude: tuple[str, int, int], te
             d = definition.match(line)
             if d and not pat.search(d.group(1) or ""):
                 continue
-            bits |= cov.at_line(rel, i)
+            if split_family is None:
+                bits |= cov.at_line(rel, i)
+                continue
+            instance = True
+            for m in pat.finditer(line):
+                recv = re.search(r"(\w+)\s*\.\s*$", line[: m.start()])
+                if recv:
+                    if recv.group(1)[:1].isupper():
+                        instance = False  # ClassName.X: read straight off a class
+                elif rel not in split_family:
+                    instance = False  # a bare name or string elsewhere
+            if instance:
+                bits |= cov.at_line(rel, i)
+            else:
+                other |= cov.at_line(rel, i)
+    if split_family is not None:
+        return bits, other
     return bits
 
 
@@ -585,15 +608,53 @@ def module_level(path: str, old_tree, new_tree, cov: CoverageMap) -> tuple[int, 
                     else:
                         ok = False
                 if ok:
+                    fam = family_of(path) if prefix else None
+                    if fam:
+                        bits &= family_users(fam, cov)
                     sel |= (bits | readers(set(name), cov, span, tests_only=True)) & imp
                     notes.append(f"dict-entries {where}")
                     continue
+            fam = family_of(path) if prefix else None
+            if fam:
+                inst, other = readers(set(name), cov, span, split_family=family_files(fam))
+                sel |= (inst & family_users(fam, cov) | other) & imp
+                notes.append(f"family-readers {where}")
+                continue
             sel |= readers(set(name), cov, span) & imp
             notes.append(f"readers {where}")
             continue
         sel |= imp
         notes.append(f"importers {where}")
     return sel, notes
+
+
+FAMILY_PKGS = ("dialects", "parsers", "generators", "typing")
+
+
+def family_of(path: str) -> str | None:
+    """'mysql' for sqlglot/{dialects,parsers,generators,typing}/mysql.py."""
+    parts = path.split("/")
+    if len(parts) == 3 and parts[0] == "sqlglot" and parts[1] in FAMILY_PKGS and parts[2].endswith(".py"):
+        name = parts[2][:-3]
+        if name not in ("dialect", "base", "__init__"):
+            return name
+    return None
+
+
+def family_files(name: str) -> set[str]:
+    return {f"sqlglot/{p}/{name}.py" for p in FAMILY_PKGS}
+
+
+def family_users(name: str, cov: CoverageMap) -> int:
+    """Tests that instantiated a class of the family (dialect, tokenizer, parser,
+    generator) or of a subclass, e.g. Doris for MySQL."""
+    mods = {f"sqlglot.{p}.{name}" for p in FAMILY_PKGS}
+    bits = 0
+    for k, desc in static().cls.items():
+        if k.split(":", 1)[0] in mods:
+            for d in desc:
+                bits |= cov.class_users(d)
+    return bits
 
 
 def _expr_refs_any(nodes) -> bool:

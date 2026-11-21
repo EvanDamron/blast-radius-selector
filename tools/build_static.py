@@ -6,7 +6,8 @@ Run with the venv Python from the sqlglot checkout on sys.path:
 
 {"defs": {name: [[relpath, body_first, last], ...]},       # every function by name
  "expr": {"module:Qualname": [relpath, [descendant keys incl. itself]]},
- "expr_by_name": {ClassName: [keys]}, "expr_by_key": {sql key: [keys]}}
+ "expr_by_name": {ClassName: [keys]}, "expr_by_key": {sql key: [keys]},
+ "cls": {"module:Qualname": [descendant keys incl. itself]}}  # every sqlglot class
 """
 import ast
 import gzip
@@ -47,7 +48,7 @@ def all_subclasses(c):
     out, stack = set(), [c]
     while stack:
         k = stack.pop()
-        for s in k.__subclasses__():
+        for s in type.__subclasses__(k):
             if s not in out:
                 out.add(s)
                 stack.append(s)
@@ -66,7 +67,13 @@ for c in classes:
     by_name.setdefault(c.__name__, []).append(key(c))
     by_key.setdefault(getattr(c, "key", c.__name__.lower()), []).append(key(c))
 
-out = {"defs": defs, "expr": expr, "expr_by_name": by_name, "expr_by_key": by_key}
+# Every class defined in sqlglot, with its descendants: for family-level users.
+everything = {c for c in all_subclasses(object) if c.__module__.startswith("sqlglot")}
+cls_map = {}
+for c in everything:
+    cls_map[key(c)] = sorted(key(d) for d in all_subclasses(c) | {c} if d.__module__.startswith("sqlglot"))
+
+out = {"defs": defs, "expr": expr, "expr_by_name": by_name, "expr_by_key": by_key, "cls": cls_map}
 blob = json.dumps(out, separators=(",", ":")).encode()
 with gzip.open(ROOT / "map" / "static.json.gz", "wb", compresslevel=9) as fh:
     fh.write(blob)

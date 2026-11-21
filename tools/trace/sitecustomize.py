@@ -23,30 +23,40 @@ if _dir:
     _classes = set()
     _getframe = sys._getframe
 
+    _inits_seen = set()
+
+    def _first_lines(code, f):
+        # LINE events skip the line a function starts on (one-line lambdas and
+        # defs would look unexecuted), so record the lines run before the first
+        # line change here.
+        first = None
+        for start, end, ln in code.co_lines():
+            if ln is None:
+                continue
+            if first is None:
+                first = ln
+                _add(code, f, ln)
+            elif ln != first:
+                _add(code, f, ln)  # the line after RESUME, e.g. a decorated one-liner
+                break
+
     def _start(code, offset):
-        if code.co_qualname == "Expr.__init__" and code.co_filename.endswith("sqlglot/expressions/core.py"):
-            # Expr.__init__ is starting: note the concrete expression class.
+        f = code.co_filename
+        if not f.startswith(_PREFIX):
+            return _DISABLE
+        if code.co_name == "__init__":
+            # Note the concrete class of self. Kept enabled so that every class
+            # inheriting this __init__ is seen.
             try:
                 cls = type(_getframe(1).f_locals["self"])
                 _classes.add(cls.__module__ + ":" + cls.__qualname__)
             except Exception:
                 pass
+            if code not in _inits_seen:
+                _inits_seen.add(code)
+                _first_lines(code, f)
             return None
-        # LINE events skip the line a function starts on (one-line lambdas and
-        # defs would look unexecuted), so record the lines run before the first
-        # line change here.
-        f = code.co_filename
-        if f.startswith(_PREFIX):
-            first = None
-            for start, end, ln in code.co_lines():
-                if ln is None:
-                    continue
-                if first is None:
-                    first = ln
-                    _add(code, f, ln)
-                elif ln != first:
-                    _add(code, f, ln)  # the line after RESUME, e.g. a decorated one-liner
-                    break
+        _first_lines(code, f)
         return _DISABLE
 
     def _add(code, f, line):
