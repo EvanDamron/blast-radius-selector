@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Merge per-test default records into map/defaults.json.gz.
 
-usage: merge.py TESTS_JSON TRACE_DIR SQLGLOT_DIR MAP_DIR
+usage: merge.py TESTS_JSON TRACE_DIR[,TRACE_DIR...] SQLGLOT_DIR MAP_DIR  (passes are unioned)
 MAP_DIR/defaults.json.gz: {"sets": [hex bitset, ...], "keys": {relpath: {qualname: {param: set index}}}}
 MAP_DIR/argtypes.json.gz: {"sets": [...], "keys": {class key: {arg: set index}},
                            "spreads": {class key: [class keys whose arg_types copy its arg_types]}}
@@ -15,14 +15,14 @@ import os
 import sys
 
 tests = json.load(open(sys.argv[1]))["tests"]
-trace = sys.argv[2]
+traces = sys.argv[2].split(",")
 bits: dict = {}
 missing: dict = {}
-for t in tests:
+for t, trace in [(t, d) for d in traces for t in tests]:
     n = t["number"]
     rc = open(os.path.join(trace, f"{n}.rc")).read().strip()
     if rc not in ("0", "5"):
-        sys.exit(f"test {n} ({t['id']}) exited {rc}")
+        sys.exit(f"test {n} ({t['id']}) exited {rc} in {trace}")
     for f in glob.glob(os.path.join(trace, str(n), "*.json")):
         rec = json.load(open(f))
         for rel, qual, param in rec["maybe_default"]:

@@ -326,7 +326,10 @@ def scopes(tree: ast.Module, text: str | None = None) -> list[Scope]:
                 k = counters.get(q, 0)
                 counters[q] = k + 1
                 q = f"{q}#{k}"
-                out.append(Scope(q, child, child.body[0].lineno, child.end_lineno, "def"))
+                # The body starts at its first statement, decorators included.
+                head = child.body[0]
+                first = min([head.lineno] + [d.lineno for d in getattr(head, "decorator_list", ())])
+                out.append(Scope(q, child, first, child.end_lineno, "def"))
                 visit(child, q)
             elif isinstance(child, ast.Lambda):
                 q = f"{qual}.<lambda>"
@@ -767,7 +770,9 @@ def _stmt_spans(func) -> list[tuple[int, int, int, int]]:
     def visit(stmts):
         for st in stmts:
             if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                out.append((st.lineno, st.end_lineno, st.end_lineno, 0))
+                # Decorators sit above the def line and run when the def statement does.
+                first = min([st.lineno] + [d.lineno for d in st.decorator_list])
+                out.append((first, st.end_lineno, st.end_lineno, 0))
                 continue
             children = []
             for field in ("body", "orelse", "finalbody"):

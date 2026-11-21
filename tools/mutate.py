@@ -383,6 +383,28 @@ def one(rng, kind, src_files):
         import mutate_extra
         fn = mutate_extra.string_literal if kind == "string" else mutate_extra.swap_statements
         return [fn(rng, src_files, _pick_tree, rel, parses_differently)]
+    if kind in ("annotation", "decorator", "base", "kwswap"):
+        import mutate_extra2
+        fn = {"annotation": mutate_extra2.annotation, "decorator": mutate_extra2.decorator_drop,
+              "base": mutate_extra2.base_swap, "kwswap": mutate_extra2.kwarg_swap}[kind]
+        return [fn(rng, src_files, _pick_tree, rel, parses_differently)]
+    if kind in ("reexport", "helpers"):
+        import mutate_extra2
+        fn = mutate_extra2.reexport_drop if kind == "reexport" else mutate_extra2.helpers_edit
+        return [fn(rng, SRC, rel, parses_differently)]
+    if kind == "samefile":
+        # two one-token edits in one file
+        path, old, mid = code_mutation(rng, src_files)
+        for _ in range(50):
+            p2, old2, new2 = code_mutation(rng, [SRC / path])
+            lines_a, lines_b = mid.split("\n"), new2.split("\n")
+            diff = [i for i, (x, y) in enumerate(zip(old2.split("\n"), lines_b)) if x != y]
+            if len(diff) == 1 and lines_a[diff[0]] == old2.split("\n")[diff[0]]:
+                lines_a[diff[0]] = lines_b[diff[0]]
+                new = "\n".join(lines_a)
+                if parses_differently(old, new):
+                    return [(path, old, new)]
+        return [(path, old, mid)]
     if kind == "multi":
         parts = []
         used = set()
