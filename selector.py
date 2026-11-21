@@ -598,6 +598,10 @@ def module_level(path: str, old_tree, new_tree, cov: CoverageMap) -> tuple[int, 
     if [x[:2] for x in a] == [x[:2] for x in b]:
         return 0, []
     imp = cov.importers(path)
+    gone = _module_names(old_tree) - _module_names(new_tree)
+    if gone:
+        # `from module import name` now fails at import time in every importer.
+        return imp, [f"module-name-removed {','.join(sorted(gone))[:80]}"]
     sm = difflib.SequenceMatcher(None, [x[0] + x[1] for x in a], [x[0] + x[1] for x in b], autojunk=False)
     olds, news = [], []
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
@@ -722,6 +726,30 @@ def family_users(name: str, cov: CoverageMap) -> int:
             for d in desc:
                 bits |= cov.class_users(d)
     return bits
+
+
+def _module_names(tree: ast.Module) -> set[str]:
+    """Names bound at module level (defs, classes, assignments, imports)."""
+    names: set[str] = set()
+
+    def visit(stmts):
+        for st in stmts:
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(st.name)
+            elif isinstance(st, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                names.update(_targets(st))
+            elif isinstance(st, (ast.Import, ast.ImportFrom)):
+                for a in st.names:
+                    names.add((a.asname or a.name).split(".")[0])
+            elif isinstance(st, (ast.If, ast.Try)):
+                visit(st.body)
+                visit(getattr(st, "orelse", []))
+                for h in getattr(st, "handlers", []):
+                    visit(h.body)
+                visit(getattr(st, "finalbody", []))
+
+    visit(tree.body)
+    return names
 
 
 def _expr_refs_any(nodes) -> bool:
