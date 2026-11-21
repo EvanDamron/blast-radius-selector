@@ -12,7 +12,7 @@ The maps in `map/` were built once from the pinned commit:
   `sys.monitoring` line tracer (`tools/trace/sitecustomize.py`, which follows
   spawned children). For each source line it records which tests executed it,
   with function code kept apart from module/class-body code. It also records
-  which files each test opened and which expression classes each test
+  which files each test opened and which sqlglot classes each test
   instantiated.
 - `static.json.gz`: every function definition by name, and the expression
   class tree.
@@ -29,7 +29,9 @@ the old and new ASTs, one scope at a time:
   helpers the entry names. An attribute of an expression class selects the tests
   that instantiated the class or a subclass. Anything else selects the tests that
   ran a line naming the changed attribute and also imported the module. Lazy
-  dialect imports keep this narrow.
+  dialect imports keep this narrow. For a dialect family's classes (dialect,
+  tokenizer, parser, generator), reads through an instance count only for tests
+  that instantiated a class of that family.
 - **Syntax errors**: every test that imports the module.
 - **Fixtures and other data files**: the tests that opened the file.
 - **pytest config**: everything, if the edit can reach pytest.
@@ -48,4 +50,5 @@ worker).
 - `evaluate.py` scores the selector on the sample and synthetic sets with the
   official `score.py`.
 
-Sample set: 179.6 s simulated with 0 misses, against 1614.1 s for the starter.
+Sample set: 170.3 s simulated with 0 misses, against 1614.1 s for the starter.
+Synthetic set (230 labeled mutations of many kinds): 0 misses.
