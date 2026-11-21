@@ -10,6 +10,7 @@ docstring edits, class-level constant edits, non-Python files.
 The labels come from running the suite (tools/label.py), never from here.
 """
 import argparse
+import os
 import ast
 import difflib
 import random
@@ -216,6 +217,138 @@ def class_constant(rng, files):
     raise RuntimeError
 
 
+def _pick_tree(rng, files):
+    p = rng.choice(files)
+    text = p.read_text()
+    return p, text, ast.parse(text), text.split("\n")
+
+
+def rename_def(rng, files):
+    for _ in range(300):
+        p, text, tree, lines = _pick_tree(rng, files)
+        defs = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and not n.name.startswith("__")]
+        if not defs:
+            continue
+        n = rng.choice(defs)
+        i = n.lineno - 1 + len(n.decorator_list)
+        while i < len(lines) and f"def {n.name}" not in lines[i]:
+            i += 1
+        if i >= len(lines):
+            continue
+        lines[i] = lines[i].replace(f"def {n.name}", f"def {n.name}_old", 1)
+        new = "\n".join(lines)
+        if parses_differently(text, new):
+            return rel(p), text, new
+    raise RuntimeError
+
+
+def dict_entry_delete(rng, files):
+    for _ in range(400):
+        p, text, tree, lines = _pick_tree(rng, files)
+        cands = []
+        for cls in ast.walk(tree):
+            if isinstance(cls, ast.ClassDef):
+                for st in cls.body:
+                    if isinstance(st, ast.Assign) and isinstance(st.value, (ast.Dict, ast.Set)):
+                        elts = st.value.values if isinstance(st.value, ast.Dict) else st.value.elts
+                        for k, e in enumerate(elts):
+                            key = st.value.keys[k] if isinstance(st.value, ast.Dict) else e
+                            if key is not None and key.lineno == e.end_lineno and key.lineno != st.lineno:
+                                cands.append(key.lineno)
+        if not cands:
+            continue
+        ln = rng.choice(cands)
+        new = "\n".join(lines[: ln - 1] + lines[ln:])
+        if parses_differently(text, new):
+            return rel(p), text, new
+    raise RuntimeError
+
+
+def default_arg(rng, files):
+    for _ in range(400):
+        p, text, tree, lines = _pick_tree(rng, files)
+        cands = []
+        for n in ast.walk(tree):
+            if isinstance(n, ast.FunctionDef):
+                for d in n.args.defaults + [d for d in n.args.kw_defaults if d is not None]:
+                    if isinstance(d, ast.Constant) and isinstance(d.value, (bool, int)) and d.lineno == d.end_lineno:
+                        cands.append(d)
+        if not cands:
+            continue
+        d = rng.choice(cands)
+        line = lines[d.lineno - 1]
+        old = line[d.col_offset:d.end_col_offset]
+        v = d.value
+        rep = str(not v) if isinstance(v, bool) else str(v + 1)
+        lines[d.lineno - 1] = line[:d.col_offset] + rep + line[d.end_col_offset:]
+        new = "\n".join(lines)
+        if parses_differently(text, new):
+            return rel(p), text, new
+    raise RuntimeError
+
+
+def return_none(rng, files):
+    for _ in range(400):
+        p, text, tree, lines = _pick_tree(rng, files)
+        rets = [n for n in ast.walk(tree) if isinstance(n, ast.Return) and n.value is not None
+                and n.lineno == n.end_lineno and not (isinstance(n.value, ast.Constant) and n.value.value is None)]
+        if not rets:
+            continue
+        n = rng.choice(rets)
+        line = lines[n.lineno - 1]
+        indent = re.match(r"\s*", line).group(0)
+        lines[n.lineno - 1] = indent + "return None"
+        new = "\n".join(lines)
+        if parses_differently(text, new):
+            return rel(p), text, new
+    raise RuntimeError
+
+
+def add_override(rng, files):
+    """Add a method to a class that overrides a base method by delegating oddly."""
+    for _ in range(400):
+        p, text, tree, lines = _pick_tree(rng, files)
+        classes = [c for c in ast.walk(tree) if isinstance(c, ast.ClassDef) and c.bases and c.body]
+        if not classes:
+            continue
+        c = rng.choice(classes)
+        methods = [m for m in c.body if isinstance(m, ast.FunctionDef) and m.args.args and m.args.args[0].arg == "self"]
+        if not methods:
+            continue
+        m = rng.choice(methods)
+        indent = re.match(r"\s*", lines[m.lineno - 1 - len(m.decorator_list)]).group(0)
+        # A wrapper that swallows the result for one specific case.
+        body = [
+            "",
+            f"{indent}def {m.name}_wrapped(self, *args, **kwargs):",
+            f"{indent}    return self.{m.name}(*args, **kwargs)",
+        ]
+        ins = c.body[-1].end_lineno
+        new = "\n".join(lines[:ins] + body + lines[ins:])
+        if parses_differently(text, new):
+            # a pure addition nobody calls: should break nothing
+            return rel(p), text, new
+    raise RuntimeError
+
+
+def import_drop(rng, files):
+    for _ in range(400):
+        p, text, tree, lines = _pick_tree(rng, files)
+        imps = [n for n in tree.body if isinstance(n, ast.ImportFrom) and len(n.names) > 1 and n.lineno == n.end_lineno]
+        if not imps:
+            continue
+        n = rng.choice(imps)
+        drop = rng.choice(n.names)
+        names = [a for a in n.names if a is not drop]
+        line = "from " + "." * n.level + (n.module or "") + " import " + ", ".join(
+            a.name + (f" as {a.asname}" if a.asname else "") for a in names)
+        lines[n.lineno - 1] = line
+        new = "\n".join(lines)
+        if parses_differently(text, new):
+            return rel(p), text, new
+    raise RuntimeError
+
+
 def other_file(rng):
     p = rng.choice([SRC / "README.md", SRC / "CHANGELOG.md", SRC / "CONTRIBUTING.md", SRC / "setup.py"])
     text = p.read_text()
@@ -242,6 +375,10 @@ def one(rng, kind, src_files):
         return [class_constant(rng, src_files)]
     if kind == "other":
         return [other_file(rng)]
+    simple = {"rename": rename_def, "dictdel": dict_entry_delete, "default": default_arg,
+              "retnone": return_none, "override": add_override, "importdrop": import_drop}
+    if kind in simple:
+        return [simple[kind](rng, src_files)]
     if kind == "multi":
         parts = []
         used = set()
@@ -265,8 +402,11 @@ def main():
     out = Path(a.out)
     (out / "commits").mkdir(parents=True, exist_ok=True)
     src_files = py_files("sqlglot")
+    ap_kinds = os.environ.get("MUTATE_KINDS")
     kinds = (["code"] * 40 + ["comment"] * 10 + ["fixture"] * 15 + ["multi"] * 10 + ["delete"] * 8
              + ["testfile"] * 5 + ["docstring"] * 3 + ["classconst"] * 7 + ["other"] * 2)
+    if ap_kinds:
+        kinds = ap_kinds.split(",")
     meta = {}
     for k in range(a.count):
         kind = rng.choice(kinds)

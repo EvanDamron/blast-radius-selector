@@ -538,16 +538,23 @@ def module_level(path: str, old_tree, new_tree, cov: CoverageMap) -> tuple[int, 
                 sel |= cov.func_lines(path, o.body[0].lineno, o.end_lineno, include_body=True)
                 notes.append(f"def-header {where}")
             else:
+                # A new function runs only if something finds it: an override of a
+                # same-named method, generator dispatch by `<key>_sql`, or a decorator.
+                if path.startswith("tests/") and name.startswith("test"):
+                    notes.append(f"new-test {where}")  # not in tests.json: cannot fail
+                    continue
                 bits = 0
                 if name.endswith("_sql"):
                     bits |= instantiators(set(static().expr_by_key.get(name[:-4], [])), cov)
                 bits |= def_bodies(name, cov)
-                if bits:
+                if n.decorator_list:
+                    sel |= imp
+                    notes.append(f"new-def(decorated) {where}")
+                elif bits:
                     sel |= bits & imp
                     notes.append(f"new-def {where}")
                 else:
-                    sel |= imp
-                    notes.append(f"new-def(unknown) {where}")
+                    notes.append(f"new-def(unreferenced) {where}")
             continue
         if kind == "assign":
             node = o if o is not None else n
