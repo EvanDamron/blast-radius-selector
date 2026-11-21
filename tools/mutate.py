@@ -379,6 +379,10 @@ def one(rng, kind, src_files):
               "retnone": return_none, "override": add_override, "importdrop": import_drop}
     if kind in simple:
         return [simple[kind](rng, src_files)]
+    if kind in ("string", "swap"):
+        import mutate_extra
+        fn = mutate_extra.string_literal if kind == "string" else mutate_extra.swap_statements
+        return [fn(rng, src_files, _pick_tree, rel, parses_differently)]
     if kind == "multi":
         parts = []
         used = set()
