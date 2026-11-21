@@ -88,6 +88,7 @@ class Commit:
         self.overlay: dict[str, str] = {}
         self.old: dict[str, str] = {}
         self.fixtures: dict[str, tuple[str, str]] = {}  # per changed SQL fixture: (old, new) text
+        self.changed: dict[str, set[int]] = {}  # per changed Python file: old lines removed or beside an insertion
         self.executable = True  # every changed file is an existing Python file
         self.note = ""
 
@@ -146,8 +147,9 @@ def analyze(cid: str, text: str, cov, valid: int) -> Commit:
                 c.other_sel |= s
                 continue
             old = (SRC / path).read_text(encoding="utf-8")
-            new, removed, _, _ = base.apply_hunks(old, fp.hunks)
+            new, removed, _, anchors = base.apply_hunks(old, fp.hunks)
             c.removed[path] = sorted(removed)
+            c.changed[path] = set(removed) | {a for p in anchors for a in (p, p + 1)}
             c.old[path] = old
             c.overlay[path] = new
             c.file_sel[path] = c.file_sel.get(path, 0) | (s & valid)
@@ -750,6 +752,92 @@ def narrow_by_fixture_reads(c: Commit) -> None:
         narrow_file(c, path, keep, "fixture-parts")
 
 
+# ------------------------------------------------------------ TPC-DS entries
+
+USE_TPCDS = os.environ.get("BR_USE_TPCDS", "1") == "1"
+TPCDS_MAP = HERE / "map" / "tpcds.json.gz"
+TPCDS_TEST = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+# x86 CPU per recorded (Apple M-series) millisecond, and the fixed cost of a proof
+# child (fork, imports, the tables it reads), both measured on a Xeon 4210R.
+TPCDS_CPU_FACTOR = 5.0
+TPCDS_FIXED_MS = 1500
+# Spend at most this share of what dropping the test saves.
+TPCDS_SHARE = 0.5
+TPCDS_WALL_BUDGET = 40.0
+_tpcds_wall = [0.0]
+
+
+def prove_tpcds(c: Commit, cov, tests: list[dict], durations: list[int]) -> None:
+    """Drop test_execute_tpcds when re-running, on the patched code, every TPC-DS entry
+    whose own run reached a changed line reproduces that entry's pinned digest
+    (tpcds_harness.run_entry: parse, the pool's pickle round trip, execute, and the
+    DuckDB transpile). Entries that reach no changed line run exactly as pinned."""
+    t = next((x["number"] for x in tests if x["id"] == TPCDS_TEST), None)
+    if t is None or not (c.sel >> t) & 1 or c.fixtures or not c.overlay or not c.executable:
+        return
+    if any(not p.startswith("sqlglot/") for p in c.overlay) or c.other_sel:
+        return
+    raw = _maps.get("tpcds")
+    if raw is None:
+        raw = _maps["tpcds"] = json.loads(gzip.decompress(TPCDS_MAP.read_bytes())) if TPCDS_MAP.exists() else {}
+    if not raw:
+        return
+    need: set[int] = set()
+    for path, lines in c.changed.items():
+        by_line = raw["lines"].get(path, {})
+        body = set(raw["body"].get(path, ()))
+        for line in lines:
+            if line in body:
+                return  # module or class level: runs at import for every entry
+            entries = by_line.get(str(line))
+            if entries:
+                need.update(entries)
+            elif (cov.at_line(path, line) >> t) & 1:
+                return  # the test runs this line outside the entries' work
+    if not need:
+        return
+    numbers = numbers_of(c.sel)
+    saving = split(numbers, durations)[0] - split([n for n in numbers if n != t], durations)[0]
+    estimate = TPCDS_FIXED_MS + TPCDS_CPU_FACTOR * sum(raw["entries"][e][2] for e in need)
+    if estimate > TPCDS_SHARE * saving or _tpcds_wall[0] > TPCDS_WALL_BUDGET:
+        return
+    order = sorted(need, key=lambda e: raw["entries"][e][2])
+    expected = [raw["entries"][e][1] for e in order]
+    start = time.monotonic()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    pid = os.fork()
+    if pid == 0:
+        code = 2
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, 1)
+            signal.alarm(int(3 * estimate / 1000) + 10)
+            sys.path.insert(0, str(SRC))
+            from execrun import _OverlayFinder
+
+            sys.meta_path.insert(0, _OverlayFinder(str(SRC), c.overlay))
+            import tpcds_harness
+            from tests.helpers import load_sql_fixture_pairs
+
+            pairs = list(load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))
+            tables = tpcds_harness.load_tables() if any(pairs[e][0].get("execute") for e in order) else None
+            code = 0
+            for e, digest in zip(order, expected):
+                if tpcds_harness.run_entry(pairs[e], tables) != digest:
+                    code = 1
+                    break
+        except BaseException:  # noqa: BLE001 - any failure means no proof
+            code = 2
+        os._exit(code)
+    _, status = os.waitpid(pid, 0)
+    _tpcds_wall[0] += time.monotonic() - start
+    ok = os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+    c.note += f" tpcds-proof:{len(order)}entries:{'same' if ok else 'differs'}"
+    if ok:
+        c.sel &= ~(1 << t)
+
+
 # ------------------------------------------------------------------- execution
 
 USE_WARM = os.environ.get("BR_USE_WARM", "0") == "1"
@@ -1109,6 +1197,13 @@ def main() -> None:
                 c.sel, c.file_sel = saved
                 log(f"{c.id}: fixture narrowing failed ({error!r})")
         commits.append(c)
+
+    if USE_TPCDS:
+        for c in commits:
+            try:
+                prove_tpcds(c, cov, tests, durations)
+            except Exception as error:
+                log(f"{c.id}: tpcds proof failed ({error!r})")
 
     final: dict[str, list[int]] = {}
     jobs: list[Job] = []

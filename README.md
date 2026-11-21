@@ -74,6 +74,13 @@ before:
 - **A SQL fixture changed**: keep the tests that read a part of the file that
   differs (a file the helpers can no longer load keeps every test that opens it).
 - Tests that open the changed source file as data are always kept.
+- **`test_execute_tpcds` (21.5 s)**: `map/tpcds.json.gz` records which source lines
+  each TPC-DS entry reaches when run on its own (`tools/tpcds/`), and a digest of
+  what the test derives from it (`tpcds_harness.py`: parse, the pool's pickle
+  round trip, execution, the DuckDB transpile). When the entries reaching the
+  changed lines are few, the selector re-runs just those on the patched code in a
+  forked child, and drops the test if every digest matches. Lines the test runs
+  outside the entries, or at module level, rule this out.
 
 The selected tests are split by longest-processing-time first, for whichever
 worker count from 1 to 8 gives the lowest cost (busiest worker plus 2 s per

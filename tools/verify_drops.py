@@ -119,7 +119,42 @@ def fixture_mutants(rng, n):
     return out
 
 
-STAGES = ("BR_USE_DEFAULTS", "BR_USE_FIXTURES")
+def tpcds_mutants(rng, n):
+    """One-token edits on lines that few TPC-DS entries reach (the proof's territory)."""
+    import gzip
+    import re
+
+    sys.path.insert(0, str(ROOT / "tools"))
+    from mutate import SWAPS
+
+    raw = json.loads(gzip.decompress((ROOT / "map/tpcds.json.gz").read_bytes()))
+    sites = [(p, int(l)) for p, d in raw["lines"].items() for l, e in d.items() if len(e) <= 10 and p.startswith("sqlglot/")]
+    rng.shuffle(sites)
+    out = []
+    for rel, ln in sites:
+        if len(out) >= n:
+            break
+        old = (SRC / rel).read_text()
+        lines = old.split("\n")
+        line = lines[ln - 1]
+        if line.strip().startswith("#"):
+            continue
+        opts = [(a, b) for a, b in SWAPS if re.search(a, line)]
+        if not opts:
+            continue
+        a, b = rng.choice(opts)
+        lines[ln - 1] = re.sub(a, b, line, count=1)
+        new = "\n".join(lines)
+        try:
+            ast.parse(new)
+        except SyntaxError:
+            continue
+        if new != old:
+            out.append(("tpcds", diff(rel, old, new)))
+    return out
+
+
+STAGES = ("BR_USE_DEFAULTS", "BR_USE_FIXTURES", "BR_USE_TPCDS")
 
 
 def select(data, env_name, on):
@@ -136,11 +171,13 @@ def main():
     ap.add_argument("count", type=int)
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--stage-env", default="all")
+    ap.add_argument("--kinds", default="argtypes,default,fixture")
     a = ap.parse_args()
     rng = random.Random(a.seed)
     out = Path(a.out)
     (out / "commits").mkdir(parents=True, exist_ok=True)
-    muts = argtypes_mutants(rng, a.count) + default_mutants(rng, a.count) + fixture_mutants(rng, a.count)
+    gens = {"argtypes": argtypes_mutants, "default": default_mutants, "fixture": fixture_mutants, "tpcds": tpcds_mutants}
+    muts = [m for k in a.kinds.split(",") for m in gens[k](rng, a.count)]
     kinds = {}
     for i, (kind, patch) in enumerate(muts):
         cid = f"v{i:03d}"
