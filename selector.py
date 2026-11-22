@@ -1342,6 +1342,114 @@ def prove_genmem(c: Commit, cov, tests: list[dict], durations: list[int]) -> Non
         c.sel &= ~(1 << t)
 
 
+# ------------------------------------------------ running test_execute_tpcds
+
+USE_TPCDS_RUN = os.environ.get("BR_USE_TPCDS_RUN", "0") == "1"
+TPCDS_DUCK = Path(os.environ.get("BR_TPCDS_DUCK", str(HERE / "map" / "tpcds_duck.pkl")))
+TPCDS_RUN_WALL = float(os.environ.get("BR_TPCDS_RUN_WALL", "75"))
+_tpcds_run_wall = [0.0]
+
+
+def run_tpcds(c: Commit, cov, tests: list[dict], durations: list[int]) -> None:
+    """When test_execute_tpcds is still selected, run it on the patched code and drop it
+    if it passes. The child does what the test does: setUpClass, then per entry the
+    parent's parse, the pool's pickle round trips and mp_execute, and subtestHelper's
+    comparison with DuckDB. Only the entries whose own run reaches a changed line run
+    (map/tpcds.json.gz), cheapest first, stopping at the first failure; a change at
+    module or class level runs every entry, and a line the test runs outside its
+    entries keeps the test. DuckDB's frame for an entry is reused from the build
+    (build_duck.py) only when the patched transpile is the same string."""
+    t = next((x["number"] for x in tests if x["id"] == TPCDS_TEST), None)
+    if (not USE_TPCDS_RUN or t is None or not (c.sel >> t) & 1 or c.fixtures or not c.overlay
+            or not c.executable or not TPCDS_DUCK.exists()):
+        return
+    if any(not p.startswith("sqlglot/") for p in c.overlay) or c.other_sel:
+        return
+    if _tpcds_run_wall[0] > TPCDS_RUN_WALL:
+        c.note += " tpcds-run:skipped(wall)"
+        return
+    raw = _maps.get("tpcds")
+    if raw is None:
+        raw = _maps["tpcds"] = json.loads(gzip.decompress(TPCDS_MAP.read_bytes())) if TPCDS_MAP.exists() else {}
+    if not raw:
+        return
+    n_entries = len(raw["entries"])
+    need: set[int] = set()
+    everything = False
+    for path, lines in proof_lines(c).items():
+        by_line = raw["lines"].get(path, {})
+        body = set(raw["body"].get(path, ()))
+        for line in lines:
+            if line in body:
+                everything = True  # module or class level: runs at import for every entry
+                continue
+            entries = by_line.get(str(line))
+            if entries:
+                need.update(entries)
+            elif (cov.at_line(path, line) >> t) & 1:
+                return  # the test runs this line outside the entries' work
+    if everything:
+        need = set(range(n_entries))
+    if not need:
+        return
+    order = sorted(need, key=lambda e: raw["entries"][e][2])
+    start = time.monotonic()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    pid = os.fork()
+    if pid == 0:
+        code = 2
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, 1)
+            os.dup2(devnull, 2)
+            # The batch has 3 minutes; a patch that makes an entry crawl fails the test anyway.
+            cap = 10 + 8 * sum(raw["entries"][e][2] for e in order) / 1000
+            signal.alarm(max(5, int(min(cap, TPCDS_RUN_WALL - _tpcds_run_wall[0] + 15))))
+            import gc
+            import pickle
+
+            gc.freeze()
+            gc.enable()
+            os.environ.setdefault("SKIP_INTEGRATION", "0")
+            os.chdir(str(SRC))
+            sys.path.insert(0, str(SRC))
+            sys.dont_write_bytecode = True
+            from execrun import _OverlayFinder
+
+            sys.meta_path.insert(0, _OverlayFinder(str(SRC), c.overlay))
+            import tests.test_executor as te
+            from sqlglot import parse_one, transpile
+            from tests.helpers import TPCDS_SCHEMA
+
+            with open(TPCDS_DUCK, "rb") as fh:
+                duck = pickle.load(fh)
+            te.TestExecutor.setUpClass()
+            case = te.TestExecutor("test_execute_tpcds")
+            te.initializer(TPCDS_SCHEMA, case.tpcds_tables)
+            code = 0
+            for e in order:
+                args, sql, _ = case.tpcds_sqls[e]
+                expression = pickle.loads(pickle.dumps(parse_one(sql)))
+                table = te.mp_execute(expression, args)
+                if table is None:
+                    continue
+                table = pickle.loads(pickle.dumps(table))
+                if e in duck and sql not in case.cache and transpile(sql, write="duckdb")[0] == duck[e][0]:
+                    case.cache[sql] = duck[e][1].copy()
+                case.subtestHelper(e, table, tpch=False)
+        except BaseException:  # noqa: BLE001 - a failing entry, or anything else: keep the test
+            code = 1
+        os._exit(code)
+    _, status, usage = os.wait4(pid, 0)
+    _tpcds_run_wall[0] += time.monotonic() - start
+    ok = os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+    c.note += (f" tpcds-run:{len(order)}entries:{'pass' if ok else 'fail'}"
+               f":cpu{(usage.ru_utime + usage.ru_stime):.1f}s")
+    if ok:
+        c.sel &= ~(1 << t)
+
+
 # ------------------------------------------------------------------- execution
 
 USE_WARM = os.environ.get("BR_USE_WARM", "0") == "1"
@@ -1736,6 +1844,10 @@ def main() -> None:
                 prove_genmem(c, cov, tests, durations)
             except Exception as error:
                 log(f"{c.id}: generator memory proof failed ({error!r})")
+            try:
+                run_tpcds(c, cov, tests, durations)
+            except Exception as error:
+                log(f"{c.id}: tpcds run failed ({error!r})")
 
     final: dict[str, list[int]] = {}
     jobs: list[Job] = []

@@ -12,11 +12,17 @@ RUN python /tmp/fetch_sqlglot.py ${SQLGLOT_COMMIT} /opt/sqlglot && test -f /opt/
 # skipped, so proofs run without it could miss a change there.
 RUN pip install --no-cache-dir --no-deps python-dateutil==4.0.0 mypy_extensions==1.2.0 typing_extensions==4.16.0 \
     && python -c "from dateutil.relativedelta import relativedelta; import mypy_extensions, typing_extensions"
+# The test module test_execute_tpcds lives in, at the labeling environment's versions:
+# the selector runs that test (BR_USE_TPCDS_RUN).
+RUN pip install --no-cache-dir --no-deps duckdb==2.0.0 numpy==2.5.5 pandas==3.1.1 pytz==2026.6 tzdata==2026.6 \
+    && python -c "import duckdb, pandas.testing"
 
-COPY selector.py base_selector.py more.py execrun.py warm.py tpcds_harness.py genmem_harness.py /app/
+COPY selector.py base_selector.py more.py execrun.py warm.py tpcds_harness.py genmem_harness.py build_duck.py /app/
 COPY map /app/map
 # The disk is read-only at run time: compile everything now.
-RUN chmod -R a+rX /opt/sqlglot /app && python -m compileall -q /app /opt/sqlglot/sqlglot /opt/sqlglot/tests/helpers.py
+RUN python /app/build_duck.py /opt/sqlglot /app/map/tpcds_duck.pkl
+RUN chmod -R a+rX /opt/sqlglot /app && python -m compileall -q /app /opt/sqlglot/sqlglot /opt/sqlglot/tests/helpers.py /opt/sqlglot/tests/test_executor.py
 ENV PYTHONDONTWRITEBYTECODE=1
+ENV BR_USE_TPCDS_RUN=1
 # Imported as a module so the bytecode compiled above is used (a script is recompiled every run).
 CMD ["python", "-c", "import sys; sys.path.insert(0, '/app'); import selector; selector.main()"]
