@@ -62,3 +62,61 @@ def run_entry(pair, tables):
     result = pickle.loads(pickle.dumps(result))
     expected_sql = transpile(sql, write="duckdb")[0]
     return hashlib.sha256(repr((result.columns, result.rows, expected_sql)).encode()).hexdigest()
+
+
+class _Stop(BaseException):
+    pass
+
+
+def _canon(node):
+    """A deterministic structure of an expression tree: class, args, type, comments."""
+    from sqlglot.expressions.core import Expr
+
+    if isinstance(node, Expr):
+        return (type(node).__qualname__,
+                tuple((k, _canon(v)) for k, v in sorted(node.args.items())),
+                _canon(getattr(node, "_type", None)),
+                tuple(node.comments or ()))
+    if isinstance(node, (list, tuple)):
+        return tuple(_canon(x) for x in node)
+    return repr(node)
+
+
+def early_digest(pair, tables, on_phase=None):
+    """Digest of what the test derives from one entry before execution starts: the
+    expression the executor's optimize() returns inside execute(), and the DuckDB
+    transpile. Execution itself is skipped. on_phase("early"/"late") marks stages."""
+    import sqlglot.executor as ex
+    from sqlglot import find_tables, parse_one, transpile
+    from tests.helpers import TPCDS_SCHEMA
+
+    phase = on_phase or (lambda name: None)
+    meta, sql, _ = pair
+    phase("early")
+    parsed = parse_one(sql)
+    phase("late")
+    expression = pickle.loads(pickle.dumps(parsed))
+    if not meta.get("execute"):
+        return "parsed"
+    used = {t.name: tables[t.name] for t in find_tables(expression)}
+    captured = []
+    original = ex.optimize
+
+    def optimize(*args, **kwargs):
+        phase("early")
+        out = original(*args, **kwargs)
+        phase("late")
+        captured.append(out)
+        raise _Stop()
+
+    ex.optimize = optimize
+    try:
+        ex.execute(expression, schema=TPCDS_SCHEMA, tables=used)
+    except _Stop:
+        pass
+    finally:
+        ex.optimize = original
+    phase("early")
+    expected_sql = transpile(sql, write="duckdb")[0]
+    phase("late")
+    return hashlib.sha256(repr((_canon(captured[0]) if captured else None, expected_sql)).encode()).hexdigest()

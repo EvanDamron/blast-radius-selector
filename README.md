@@ -84,7 +84,16 @@ before:
   round trip, execution, the DuckDB transpile). When the entries reaching the
   changed lines are few, the selector re-runs just those on the patched code in a
   forked child, and drops the test if every digest matches. Lines the test runs
-  outside the entries, or at module level, rule this out.
+  outside the entries, or at module level, rule this out. A cheaper staged form
+  runs first (`map/tpcds_stages.json.gz`): when every changed line runs only in the
+  entries' early stages (parsing, the executor's optimizer call, the DuckDB
+  transpile) and never in pickling, schema and table setup, planning, execution or
+  module-level code, it compares only those stages' outputs, since the later stages
+  then receive identical input and run identical code.
+- **`test_generator_memory`**: `map/genmem.json.gz` records which lines each
+  dialect's subtest reaches; the selector re-runs only the affected dialects'
+  generator loop and memory check on the patched code, and drops the test if they
+  all pass.
 
 The selected tests are split by longest-processing-time first, for whichever
 worker count from 1 to 8 gives the lowest cost (busiest worker plus 2 s per

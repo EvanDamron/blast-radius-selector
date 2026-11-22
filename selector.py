@@ -879,9 +879,89 @@ TPCDS_TEST = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
 TPCDS_CPU_FACTOR = 5.0
 TPCDS_FIXED_MS = 1500
 # Spend at most this share of what dropping the test saves.
-TPCDS_SHARE = 0.5
-TPCDS_WALL_BUDGET = 40.0
+TPCDS_SHARE = float(os.environ.get("BR_TPCDS_SHARE", "0.5"))
+TPCDS_WALL_BUDGET = float(os.environ.get("BR_TPCDS_WALL", "60"))
 _tpcds_wall = [0.0]
+
+
+TPCDS_STAGES_MAP = HERE / "map" / "tpcds_stages.json.gz"
+
+
+def prove_tpcds_staged(c: Commit, cov, tests: list[dict], durations: list[int]) -> None:
+    """Drop test_execute_tpcds when every changed line runs only in the early stages of
+    the TPC-DS entries (parse, the executor's optimize, the DuckDB transpile: never in
+    pickling, schema and tables, planning or execution, nor at module level) and, on the
+    patched code, those stages produce for every entry that reaches a changed line the
+    same output as pinned (tpcds_harness.early_digest). The late stages then receive
+    identical input and run identical code."""
+    t = next((x["number"] for x in tests if x["id"] == TPCDS_TEST), None)
+    if t is None or not (c.sel >> t) & 1 or c.fixtures or not c.overlay or not c.executable:
+        return
+    if any(not p.startswith("sqlglot/") for p in c.overlay) or c.other_sel:
+        return
+    raw = _maps.get("tpcds_stages")
+    if raw is None:
+        raw = _maps["tpcds_stages"] = (json.loads(gzip.decompress(TPCDS_STAGES_MAP.read_bytes()))
+                                       if TPCDS_STAGES_MAP.exists() else {})
+    if not raw:
+        return
+    if "late_sets" not in raw:
+        raw["late_sets"] = {p: set(ls) for p, ls in raw["late"].items()}
+        raw["body_sets"] = {p: set(ls) for p, ls in raw["body"].items()}
+    need: set[int] = set()
+    for path, lines in c.changed.items():
+        late, body = raw["late_sets"].get(path, ()), raw["body_sets"].get(path, ())
+        early = raw["early"].get(path, {})
+        for line in lines:
+            if line in late or line in body:
+                return
+            entries = early.get(str(line))
+            if entries:
+                need.update(entries)
+            elif (cov.at_line(path, line) >> t) & 1:
+                return
+    if not need:
+        return
+    numbers = numbers_of(c.sel)
+    saving = split(numbers, durations)[0] - split([n for n in numbers if n != t], durations)[0]
+    estimate = TPCDS_FIXED_MS + TPCDS_CPU_FACTOR * sum(raw["early_ms"][e] for e in need)
+    if estimate > TPCDS_SHARE * saving or _tpcds_wall[0] > TPCDS_WALL_BUDGET:
+        return
+    order = sorted(need)
+    expected = [raw["early_digest"][e] for e in order]
+    start = time.monotonic()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    pid = os.fork()
+    if pid == 0:
+        code = 2
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, 1)
+            signal.alarm(int(3 * estimate / 1000) + 10)
+            sys.path.insert(0, str(SRC))
+            from execrun import _OverlayFinder
+
+            sys.meta_path.insert(0, _OverlayFinder(str(SRC), c.overlay))
+            import tpcds_harness
+            from tests.helpers import load_sql_fixture_pairs
+
+            pairs = list(load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))
+            tables = tpcds_harness.load_tables()
+            code = 0
+            for e, digest in zip(order, expected):
+                if tpcds_harness.early_digest(pairs[e], tables) != digest:
+                    code = 1
+                    break
+        except BaseException:  # noqa: BLE001 - any failure means no proof
+            code = 2
+        os._exit(code)
+    _, status = os.waitpid(pid, 0)
+    _tpcds_wall[0] += time.monotonic() - start
+    ok = os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+    c.note += f" tpcds-staged:{len(order)}entries:{'same' if ok else 'differs'}"
+    if ok:
+        c.sel &= ~(1 << t)
 
 
 def prove_tpcds(c: Commit, cov, tests: list[dict], durations: list[int]) -> None:
@@ -1401,6 +1481,11 @@ def main() -> None:
 
     if USE_TPCDS:
         for c in commits:
+            try:
+                if os.environ.get("BR_USE_TPCDS_STAGED", "1") == "1":
+                    prove_tpcds_staged(c, cov, tests, durations)
+            except Exception as error:
+                log(f"{c.id}: staged tpcds proof failed ({error!r})")
             try:
                 prove_tpcds(c, cov, tests, durations)
             except Exception as error:
