@@ -1342,6 +1342,167 @@ def prove_genmem(c: Commit, cov, tests: list[dict], durations: list[int]) -> Non
         c.sel &= ~(1 << t)
 
 
+# --------------------------------------------- optimizer fixture-entry proof
+
+USE_OPTFIX = os.environ.get("BR_USE_OPTFIX", "0") == "1"
+OPTFIX_MAP = HERE / "map" / "optfix.json.gz"
+OPTFIX_CLASS = "tests/test_optimizer.py::TestOptimizer::"
+OPTFIX_FIXED_MS = int(os.environ.get("BR_OPTFIX_FIXED_MS", "500"))
+
+
+def _stub_duckdb_pandas() -> None:
+    """Stand-ins for the two third-party modules tests/test_optimizer.py imports. They
+    can only make a test fail: setUpClass may connect and run statements, but reading
+    any result and assert_frame_equal raise, so an entry that executes SQL in DuckDB
+    fails its subtest and its test is not dropped."""
+    import types
+
+    class _Result:
+        def __getattr__(self, name):
+            raise RuntimeError("duckdb is not available in the proof")
+
+    class _Connection:
+        def execute(self, *args, **kwargs):
+            return _Result()
+
+        def __getattr__(self, name):
+            raise RuntimeError("duckdb is not available in the proof")
+
+    def connect(*args, **kwargs):
+        return _Connection()
+
+    def assert_frame_equal(*args, **kwargs):
+        raise AssertionError("pandas is not available in the proof")
+
+    duckdb = types.ModuleType("duckdb")
+    duckdb.connect = connect
+    pandas = types.ModuleType("pandas")
+    testing = types.ModuleType("pandas.testing")
+    testing.assert_frame_equal = assert_frame_equal
+    pandas.testing = testing
+    sys.modules["duckdb"] = duckdb
+    sys.modules["pandas"] = pandas
+    sys.modules["pandas.testing"] = testing
+
+
+def prove_optfix(c: Commit, cov, tests: list[dict], durations: list[int]) -> None:
+    """Drop fixture-driven tests of tests/test_optimizer.py (check_file and the
+    annotate loops) whose entries pass on the patched code. map/optfix.json.gz holds
+    each entry's own coverage (the real test run with the fixture loader yielding that
+    entry alone). A test qualifies when every changed line it reaches is reached only
+    inside entries: never while importing, in the test's run with no entries, or at
+    module or class level. The real test then runs on the patched code with the loader
+    yielding just the entries that reach a changed line; the others run exactly as
+    pinned, where the test passes."""
+    if not USE_OPTFIX or not c.sel or c.fixtures or not c.overlay or not c.executable:
+        return
+    if any(not p.startswith("sqlglot/") for p in c.overlay) or c.other_sel:
+        return
+    raw = _maps.get("optfix")
+    if raw is None:
+        raw = _maps["optfix"] = json.loads(gzip.decompress(OPTFIX_MAP.read_bytes())) if OPTFIX_MAP.exists() else {}
+    if not raw:
+        return
+    number = {x["id"]: x["number"] for x in tests}
+    imported = {p: set(v) for p, v in raw["import"].items()}
+    imported_body = {p: set(v) for p, v in raw["import_body"].items()}
+    cands = []
+    for name, t in raw["tests"].items():
+        n = number.get(OPTFIX_CLASS + name)
+        if n is None or not (c.sel >> n) & 1 or not t["ok"]:
+            continue
+        need: set[int] = set()
+        ok = True
+        for path, lines in c.changed.items():
+            outside = (imported.get(path, set()) | imported_body.get(path, set())
+                       | set(t["body"].get(path, ())) | set(t["skeleton"].get(path, ())))
+            by_line = t["lines"].get(path, {})
+            for line in lines:
+                if line in outside:
+                    ok = False
+                    break
+                entries = by_line.get(str(line))
+                if entries:
+                    need.update(entries)
+                elif (cov.at_line(path, line) >> n) & 1:
+                    ok = False  # the test runs this line somewhere the entry traces did not see
+                    break
+            if not ok:
+                break
+        if ok and need:
+            cost = sum(t["entries"][e][2] for e in need)
+            cands.append((cost, n, name, sorted(need)))
+    if not cands:
+        return
+    cands.sort()
+    numbers = numbers_of(c.sel)
+    drop = {n for _, n, _, _ in cands}
+    saving = split(numbers, durations)[0] - split([x for x in numbers if x not in drop], durations)[0]
+    estimate = OPTFIX_FIXED_MS + TPCDS_CPU_FACTOR * sum(cost for cost, _, _, _ in cands)
+    if estimate > TPCDS_SHARE * saving or _tpcds_wall[0] > TPCDS_WALL_BUDGET:
+        return
+    keep = {name: [tuple(raw["tests"][name]["entries"][e][:2]) for e in need] for _, _, name, need in cands}
+    start = time.monotonic()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.close(r)
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, 1)
+            os.dup2(devnull, 2)
+            signal.alarm(int(3 * estimate / 1000) + 10)
+            import gc
+            import unittest
+
+            gc.freeze()  # the selector's own objects: never garbage, never worth scanning
+            gc.enable()
+            os.environ.setdefault("SKIP_INTEGRATION", "0")
+            os.chdir(str(SRC))
+            sys.path.insert(0, str(SRC))
+            sys.dont_write_bytecode = True
+            from execrun import SyncPool, _OverlayFinder
+
+            sys.meta_path.insert(0, _OverlayFinder(str(SRC), c.overlay))
+            _stub_duckdb_pandas()
+            import tests.test_optimizer as T
+
+            T.ProcessPoolExecutor = SyncPool
+            original = T.load_sql_fixture_pairs
+            wanted: set = set()
+
+            def filtered(filename):
+                for i, item in enumerate(original(filename)):
+                    if (filename, i) in wanted:
+                        yield item
+
+            T.load_sql_fixture_pairs = filtered
+            for _, n, name, _ in cands:
+                wanted.clear()
+                wanted.update(keep[name])
+                res = unittest.TestResult()
+                unittest.TestSuite([T.TestOptimizer(name)]).run(res)
+                if res.wasSuccessful() and res.testsRun == 1 and not res.skipped:
+                    os.write(w, f"{n}\n".encode())
+        except BaseException:  # noqa: BLE001 - whatever ran no further proves nothing more
+            pass
+        os._exit(0)
+    os.close(w)
+    data = b""
+    while chunk := os.read(r, 65536):
+        data += chunk
+    os.close(r)
+    _, _, usage = os.wait4(pid, 0)
+    _tpcds_wall[0] += time.monotonic() - start
+    passed = {int(x) for x in data.split()}
+    c.note += (f" optfix:{len(cands)}tests:{len(passed)}pass:est{estimate:.0f}"
+               f":cpu{(usage.ru_utime + usage.ru_stime) * 1000:.0f}")
+    for n in passed:
+        c.sel &= ~(1 << n)
+
+
 # ------------------------------------------------------------------- execution
 
 USE_WARM = os.environ.get("BR_USE_WARM", "0") == "1"
@@ -1736,6 +1897,10 @@ def main() -> None:
                 prove_genmem(c, cov, tests, durations)
             except Exception as error:
                 log(f"{c.id}: generator memory proof failed ({error!r})")
+            try:
+                prove_optfix(c, cov, tests, durations)
+            except Exception as error:
+                log(f"{c.id}: optimizer fixture proof failed ({error!r})")
 
     final: dict[str, list[int]] = {}
     jobs: list[Job] = []

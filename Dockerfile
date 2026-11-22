@@ -16,7 +16,9 @@ RUN pip install --no-cache-dir --no-deps python-dateutil==4.0.0 mypy_extensions=
 COPY selector.py base_selector.py more.py execrun.py warm.py tpcds_harness.py genmem_harness.py /app/
 COPY map /app/map
 # The disk is read-only at run time: compile everything now.
-RUN chmod -R a+rX /opt/sqlglot /app && python -m compileall -q /app /opt/sqlglot/sqlglot /opt/sqlglot/tests/helpers.py
+RUN chmod -R a+rX /opt/sqlglot /app && python -m compileall -q /app /opt/sqlglot/sqlglot /opt/sqlglot/tests/__init__.py /opt/sqlglot/tests/helpers.py /opt/sqlglot/tests/test_optimizer.py
 ENV PYTHONDONTWRITEBYTECODE=1
+# Prove fixture-driven optimizer tests unaffected by re-running the entries a patch reaches.
+ENV BR_USE_OPTFIX=1
 # Imported as a module so the bytecode compiled above is used (a script is recompiled every run).
 CMD ["python", "-c", "import sys; sys.path.insert(0, '/app'); import selector; selector.main()"]

@@ -103,6 +103,17 @@ before:
   generator loop and memory check on the patched code, and drops the test if they
   all pass.
 
+- **Fixture-driven optimizer tests** (`BR_USE_OPTFIX`, on in the image): the 24
+  tests in `tests/test_optimizer.py` that loop over a SQL fixture (`check_file` and
+  the annotate loops). `map/optfix.json.gz` (`tools/optfix/trace.py`) records each
+  fixture entry's own coverage: the real test, run with the fixture loader yielding
+  that entry alone. A test qualifies only when every changed line it reaches is
+  reached inside entries, never while importing, in the test's run with no entries,
+  or at module or class level. The real test then runs on the patched code with the
+  loader yielding just the entries that reach a changed line (the others run as
+  pinned), and is dropped if it passes. DuckDB and pandas are replaced in that run by
+  stand-ins that make any entry needing them fail, so such tests are kept.
+
 The selected tests are split by longest-processing-time first, for whichever
 worker count from 1 to 8 gives the lowest cost (busiest worker plus 2 s per
 worker).
