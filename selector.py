@@ -1274,6 +1274,7 @@ USE_OPTFIX = os.environ.get("BR_USE_OPTFIX", "0") == "1"
 OPTFIX_MAP = HERE / "map" / "optfix.json.gz"
 OPTFIX_CLASS = "tests/test_optimizer.py::TestOptimizer::"
 OPTFIX_FIXED_MS = int(os.environ.get("BR_OPTFIX_FIXED_MS", "500"))
+OPTFIX_SHARE = float(os.environ.get("BR_OPTFIX_SHARE", str(TPCDS_SHARE)))
 
 
 def _stub_duckdb_pandas() -> None:
@@ -1365,7 +1366,7 @@ def prove_optfix(c: Commit, cov, tests: list[dict], durations: list[int]) -> Non
     drop = {n for _, n, _, _ in cands}
     saving = split(numbers, durations)[0] - split([x for x in numbers if x not in drop], durations)[0]
     estimate = OPTFIX_FIXED_MS + TPCDS_CPU_FACTOR * sum(cost for cost, _, _, _ in cands)
-    if estimate > TPCDS_SHARE * saving or _tpcds_wall[0] > TPCDS_WALL_BUDGET:
+    if estimate > OPTFIX_SHARE * saving or _tpcds_wall[0] > TPCDS_WALL_BUDGET:
         return
     keep = {name: [tuple(raw["tests"][name]["entries"][e][:2]) for e in need] for _, _, name, need in cands}
     start = time.monotonic()
