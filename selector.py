@@ -924,7 +924,7 @@ TPCDS_TEST = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
 TPCDS_CPU_FACTOR = 5.0
 TPCDS_FIXED_MS = 1500
 # Spend at most this share of what dropping the test saves.
-TPCDS_SHARE = float(os.environ.get("BR_TPCDS_SHARE", "0.5"))
+TPCDS_SHARE = float(os.environ.get("BR_TPCDS_SHARE", "100"))  # diagnostic: always attempt
 TPCDS_WALL_BUDGET = float(os.environ.get("BR_TPCDS_WALL", "60"))
 _tpcds_wall = [0.0]
 
