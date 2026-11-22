@@ -142,6 +142,7 @@ class Zygote:
         self.job_r = job_r
         self.out = os.fdopen(out_w, "w", buffering=1)
         self.started: set = set()
+        self._checked: dict = {}
         self.index: dict | None = None
         self.index_modules = -1
         self.workers: dict[int, int] = {}
@@ -203,14 +204,10 @@ class Zygote:
             path = getattr(sys.modules[name], "__file__", None)
             if not path:
                 return None
-            try:
-                new = compile(text, path, "exec", dont_inherit=True)
-            except BaseException:  # noqa: BLE001 - e.g. a syntax error
+            checked = self._structure(rel, text, path)
+            if checked is None:
                 return None
-            pairs: list = []
-            orphans: list = []
-            if not function_changes(_pinned_code(path), new, pairs, orphans):
-                return None
+            new, pairs, orphans = checked
             index = self.functions()
             for old, _, _ in pairs:
                 if _key(old, path) in self.started:
@@ -229,6 +226,36 @@ class Zygote:
                     swaps.append((fn, new_code))
         return swaps, lazy
 
+    def _structure(self, rel: str, text: str, path: str):
+        """(patched code, changed functions, orphans), or None when the patch changes
+        anything outside function bodies. Cached for the job being handled."""
+        if rel not in self._checked:
+            try:
+                new = compile(text, path, "exec", dont_inherit=True)
+            except BaseException:  # noqa: BLE001 - e.g. a syntax error
+                self._checked[rel] = None
+                return None
+            pairs: list = []
+            orphans: list = []
+            ok = function_changes(_pinned_code(path), new, pairs, orphans)
+            self._checked[rel] = (new, pairs, orphans) if ok else None
+        return self._checked[rel]
+
+    def refused_early(self, overlay: dict[str, str]) -> bool:
+        """True when a module that is already imported changes outside function bodies:
+        such a job is refused whatever the test imports do, so skip them."""
+        for rel, text in overlay.items():
+            parts = rel[:-3].split("/")
+            if parts[-1] == "__init__":
+                parts = parts[:-1]
+            mod = sys.modules.get(".".join(parts))
+            if mod is None:
+                continue
+            path = getattr(mod, "__file__", None)
+            if not path or not rel.startswith("sqlglot/") or self._structure(rel, text, path) is None:
+                return True
+        return False
+
     def handle(self, job: dict) -> None:
         jid = job["id"]
         files = []
@@ -239,6 +266,10 @@ class Zygote:
         # A test module that is itself patched, or imports a patched module at load, must
         # not be imported here first: plan() below sees what is loaded after this step.
         import time as _t
+        self._checked = {}
+        if self.refused_early(job["overlay"]):
+            self.out.write(f"{jid} cold\n")
+            return
         t0 = _t.process_time()
         changed = []
         for rel in job["overlay"]:
@@ -257,6 +288,7 @@ class Zygote:
             self.out.write(f"{jid} cold\n")
             return
         swaps, lazy = plan
+        gc.freeze()  # the warm process's modules: never garbage, not worth a worker's scans
         pid = os.fork()
         if pid == 0:
             try:

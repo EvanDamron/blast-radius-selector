@@ -1390,6 +1390,7 @@ def prove_genmem(c: Commit, cov, tests: list[dict], durations: list[int]) -> Non
 USE_WARM = os.environ.get("BR_USE_WARM", "0") == "1"
 STOP_ON_FAIL = os.environ.get("BR_STOP_ON_FAIL", "1") == "1"
 PARALLEL = int(os.environ.get("BR_PARALLEL", "2"))
+WARM_ONLY = os.environ.get("BR_WARM_ONLY", "0") == "1"
 _THIRD_PARTY = ("numpy", "pandas", "duckdb")
 
 
@@ -1529,6 +1530,69 @@ class Warm:
         os.close(self.fd)
 
 
+EXEC_BUDGET_SWAP_MS = int(os.environ.get("BR_EXEC_BUDGET_SWAP_MS", "6000"))
+EXEC_BUDGET_LAZY_MS = int(os.environ.get("BR_EXEC_BUDGET_LAZY_MS", "2500"))
+EXEC_TEST_OVERHEAD_MS = 20
+_EAGER: set = set()
+
+
+def exec_safe(c: Commit) -> bool:
+    """Running candidates in an isolated worker is ground truth only for changes inside
+    function bodies of sqlglot modules: a module- or class-level change, a test file, a
+    data file, or code a pytest session reaches differently (collection-time imports,
+    state left by earlier tests) can affect tests in ways one isolated run cannot show."""
+    if not c.executable or not c.overlay or c.fixtures or c.other_sel:
+        return False
+    for path in c.overlay:
+        if not path.startswith("sqlglot/"):
+            return False
+        kinds = [k.split(":", 1)[1] for k in c.kinds if k.startswith(path + ":")]
+        for k in kinds:
+            for part in k.split(", "):
+                if not part.startswith(("stmt ", "func ")):
+                    return False
+        if set(c.changed.get(path, ())) & base.session_only_lines(path):
+            return False
+    return not proof_blocked(c)
+
+
+def exec_candidates(c: Commit, numbers: list[int], tests: list[dict], durations: list[int], no_exec) -> list[int]:
+    """Tests worth running for this commit: each one's estimated cost (its recorded time
+    plus a small per-test overhead) at most max(1.5 s, 0.7 x (2 s + its recorded time)),
+    taken by recorded time saved per cost until the commit's budget is spent (larger
+    when every changed module is one the warm process already holds)."""
+    if not _EAGER:
+        try:
+            _EAGER.update(json.loads((HERE / "map" / "eager_modules.json").read_text())["paths"])
+        except Exception:
+            _EAGER.add("")
+    budget = EXEC_BUDGET_SWAP_MS if all(p in _EAGER for p in c.overlay) else EXEC_BUDGET_LAZY_MS
+    picks = []
+    for n in numbers:
+        if n in no_exec or "::TestExecutor::" in tests[n]["id"]:
+            continue  # TestExecutor's setUpClass loads every TPC table: seconds before any test
+        est = durations[n] + EXEC_TEST_OVERHEAD_MS
+        if est <= max(1500, 0.7 * (2000 + durations[n])):
+            picks.append((durations[n] / est, est, n))
+    picks.sort(key=lambda x: (-x[0], x[1]))
+    run, spent = [], 0
+    for _, est, n in picks:
+        if spent + est > budget:
+            continue
+        run.append(n)
+        spent += est
+    if not run:
+        return []
+    # Dropping the candidates only pays if it shrinks the commit's cost (a long test that
+    # stays selected keeps the busiest worker): require the saving if all pass to cover
+    # the run with margin.
+    rest = set(run)
+    saving = split(numbers, durations)[0] - split([n for n in numbers if n not in rest], durations)[0]
+    if saving < 1.2 * spent:
+        return []
+    return run
+
+
 def rss_kb(pid: int) -> int:
     try:
         with open(f"/proc/{pid}/statm") as fh:
@@ -1572,7 +1636,8 @@ def run_all(jobs: list[Job], start: float) -> None:
     never ran keeps mode ""."""
     if not jobs:
         return
-    preload_third_party(jobs)
+    if not (USE_WARM and WARM_ONLY):
+        preload_third_party(jobs)  # the warm process imports what its jobs need itself
     warm = None
     if USE_WARM:
         try:
@@ -1617,7 +1682,12 @@ def run_all(jobs: list[Job], start: float) -> None:
                 if j is None or j.mode == "cold":
                     continue
                 if words[1] == b"cold":
-                    j.start_cold()
+                    if WARM_ONLY:
+                        # A fresh interpreter costs a full sqlglot import: keep the selection.
+                        j.finished, j.mode = True, ""
+                        j.c.note += " exec-refused"
+                    else:
+                        j.start_cold()
                 elif words[1] == b"pid":
                     j.pid = int(words[2])
                     j.mode = "warm"
@@ -1787,26 +1857,20 @@ def main() -> None:
     for c in commits:
         numbers = numbers_of(c.sel)
         final[c.id] = numbers
-        if not USE_EXEC or not numbers or not c.executable or not c.overlay:
+        if not USE_EXEC or not numbers or not exec_safe(c):
             continue
-        if any(not p.startswith("sqlglot/") for p in c.overlay):
+        run = exec_candidates(c, numbers, tests, durations, no_exec)
+        if not run:
             continue
-        if any(n in no_exec for n in numbers):
-            continue
-        total = sum(durations[n] for n in numbers)
-        estimate = EXEC_OVERHEAD_MS + total
-        if any("::TestExecutor::" in tests[n]["id"] for n in numbers):
-            estimate += EXECUTOR_SETUP_MS
-        # Running costs about the candidates' recorded time; it pays when they would all
-        # pass, which frees the whole selection. EXEC_SHARE is the share of the static cost
-        # we are willing to spend on finding out.
-        if estimate > EXEC_LIMIT_MS or estimate > EXEC_SHARE * split(numbers, durations)[0]:
-            continue
-        jobs.append(Job(len(jobs), c, numbers, tests, 10.0 + 5.0 * total / 1000))
+        total = sum(durations[n] for n in run)
+        jobs.append(Job(len(jobs), c, run, tests, 10.0 + 5.0 * total / 1000))
     run_all(jobs, start)
     for j in jobs:
         if j.mode:
-            final[j.c.id] = j.keep()
+            # Candidates not run stay selected, and so does every run one that failed,
+            # timed out or did not finish.
+            ran = set(j.numbers)
+            final[j.c.id] = sorted(set(n for n in final[j.c.id] if n not in ran) | set(j.keep()))
 
     for c in commits:
         cost, workers = split(final[c.id], durations)
