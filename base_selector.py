@@ -31,7 +31,7 @@ WORKER_COST = 2000  # milliseconds
 MAX_WORKERS = 8
 
 # Files pytest reads at startup: a broken or pytest-related edit reaches every test.
-PYTEST_CONFIG = {"pyproject.toml", "setup.cfg", "pytest.ini", "tox.ini"}
+PYTEST_CONFIG = {"pyproject.toml", "setup.cfg", "pytest.ini", "tox.ini", "pytest.toml", ".pytest.toml", ".pytest.ini"}
 
 
 def log(*args) -> None:
@@ -761,14 +761,36 @@ def module_level(path: str, old_tree, new_tree, cov: CoverageMap) -> tuple[int, 
         where = f"{prefix}{name if kind != 'other' else type(o or n).__name__}"
         if kind == "def":
             if o is not None:
+                if n is not None and _runs_at_definition_differs(o, n, new_tree):
+                    # Decorators, defaults and (without postponed evaluation) annotations run
+                    # when the def statement runs, at import: every importer.
+                    sel |= imp
+                    notes.append(f"def-statement {where}")
+                    continue
                 # Whoever calls the function runs its body.
                 sel |= cov.func_lines(path, o.body[0].lineno, o.end_lineno, include_body=True)
                 notes.append(f"def-header {where}")
             else:
                 # A new function runs only if something finds it: an override of a
                 # same-named method, generator dispatch by `<key>_sql`, or a decorator.
+                if name.startswith("__") and name.endswith("__"):
+                    # Python calls protocol methods implicitly (truth value, comparison,
+                    # hashing, attribute access, class creation, copying...).
+                    sel |= imp
+                    notes.append(f"new-dunder {where}")
+                    continue
                 if path.startswith("tests/") and name.startswith("test"):
+                    if _existing_test_name(path, name):
+                        sel |= imp  # redefines a test that exists: the later def wins
+                        notes.append(f"redefined-test {where}")
+                        continue
                     notes.append(f"new-test {where}")  # not in tests.json: cannot fail
+                    continue
+                if path.startswith("tests/"):
+                    # unittest and pytest call hooks (setUp, setUpClass, setUpModule,
+                    # setup_method...) and TestCase overrides by name for every test.
+                    sel |= imp
+                    notes.append(f"new-test-helper {where}")
                     continue
                 bits = 0
                 if name.endswith("_sql"):
@@ -784,6 +806,22 @@ def module_level(path: str, old_tree, new_tree, cov: CoverageMap) -> tuple[int, 
                     notes.append(f"new-def(unreferenced) {where}")
             continue
         if kind == "assign":
+            if any(t.startswith("__") and t.endswith("__") for t in name):
+                # __slots__, __hash__, __eq__ = ..., __match_args__...: read implicitly.
+                sel |= imp
+                notes.append(f"dunder-assign {where}")
+                continue
+            if any(t.endswith("_sql") for t in name):
+                # Generators dispatch by scanning dir(cls) for `<key>_sql`.
+                bits = 0
+                for t in name:
+                    if t.endswith("_sql"):
+                        bits |= instantiators(set(static().expr_by_key.get(t[:-4], [])), cov)
+                if not bits:
+                    bits = imp
+                sel |= (bits | readers(set(name), cov, (path, 0, -1))) & imp
+                notes.append(f"sql-dispatch-assign {where}")
+                continue
             node = o if o is not None else n
             span = (path, node.lineno, node.end_lineno) if o is not None else (path, 0, -1)
             exprs = _expr_class_of(path, prefix)
@@ -830,6 +868,57 @@ def module_level(path: str, old_tree, new_tree, cov: CoverageMap) -> tuple[int, 
         sel |= imp
         notes.append(f"importers {where}")
     return sel, notes
+
+
+def _literal_or_none(node):
+    if node is None:
+        return True, None
+    try:
+        return True, ast.literal_eval(node)
+    except Exception:
+        return False, None
+
+
+def _postponed_annotations(tree) -> bool:
+    return any(isinstance(st, ast.ImportFrom) and st.module == "__future__"
+               and any(a.name == "annotations" for a in st.names) for st in tree.body)
+
+
+def _runs_at_definition_differs(o, n, new_tree) -> bool:
+    """Whether code that runs when the def statement runs differs: decorators, default
+    values that are not both literals, and annotations unless they are postponed."""
+    if [sdump(d) for d in o.decorator_list] != [sdump(d) for d in n.decorator_list]:
+        return True
+    od = list(o.args.defaults) + list(o.args.kw_defaults)
+    nd = list(n.args.defaults) + list(n.args.kw_defaults)
+    if len(od) != len(nd):
+        return any(not _literal_or_none(x)[0] for x in od + nd)
+    for a, b in zip(od, nd):
+        if (a is None) != (b is None) or (a is not None and sdump(a) != sdump(b)):
+            if not (_literal_or_none(a)[0] and _literal_or_none(b)[0]):
+                return True
+    if not _postponed_annotations(new_tree):
+        def anns(f):
+            args = f.args.posonlyargs + f.args.args + f.args.kwonlyargs + [f.args.vararg, f.args.kwarg]
+            return [sdump(x.annotation) if x is not None and x.annotation is not None else None for x in args] + [
+                sdump(f.returns) if f.returns is not None else None]
+        if anns(o) != anns(n):
+            return True
+    return False
+
+
+_TEST_IDS = None
+
+
+def _existing_test_name(path: str, name: str) -> bool:
+    global _TEST_IDS
+    if _TEST_IDS is None:
+        try:
+            _TEST_IDS = {t["id"] for t in json.loads((DATA / "tests.json").read_text())["tests"]}
+        except Exception:
+            _TEST_IDS = set()
+            return True  # cannot tell: assume it exists
+    return any(i.startswith(path + "::") and i.endswith("::" + name) for i in _TEST_IDS)
 
 
 FAMILY_PKGS = ("dialects", "parsers", "generators", "typing")
@@ -994,9 +1083,11 @@ def analyze_python(path: str, old: str, new: str, removed, added, cov: CoverageM
             s = 0
             ok = True
             pts = [ln for ln in removed if o.first <= ln <= o.last]
-            for p in anchors:
-                if o.first - 1 <= p <= o.last:
-                    pts += [p, p + 1]
+            if any(o.first - 1 <= p <= o.last for p in anchors):
+                # Inserted lines may sit at a shallower nesting than either neighbour (after
+                # a nested block ends, or before an elif/except), so a neighbour's tests
+                # are not all the runs that reach them: use the whole function.
+                ok = False
             if not pts:
                 ok = False
             for ln in pts:
@@ -1059,6 +1150,29 @@ def _config_matters(path: str, fp: FilePatch) -> bool:
     return False
 
 
+def _shadows_a_module(path: str) -> bool:
+    """A new .py file that can change what an import statement resolves to: anything
+    directly at the repository root (it is first on sys.path), a new package directory's
+    __init__.py at the root, or a module or package whose dotted name already exists."""
+    parts = path.split("/")
+    if len(parts) == 1 or (len(parts) == 2 and parts[1] == "__init__.py" and not (SRC / parts[0]).is_dir()):
+        return True
+    if parts[-1] == "__init__.py":
+        stem = "/".join(parts[:-1])
+        return (SRC / (stem + ".py")).exists()
+    stem = path[:-3]
+    return (SRC / stem).is_dir()
+
+
+_CODING = re.compile(r"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")
+
+
+def _coding_changed(old: str, new: str) -> bool:
+    """PEP 263: a coding declaration in the first two lines changes how the file is read."""
+    o, n = old.splitlines()[:2], new.splitlines()[:2]
+    return o != n and any(_CODING.match(line) for line in o + n)
+
+
 def analyze_file(fp: FilePatch, cov: CoverageMap) -> tuple[int, str]:
     old_path, new_path = fp.old_path, fp.new_path
     path = old_path or new_path
@@ -1068,8 +1182,14 @@ def analyze_file(fp: FilePatch, cov: CoverageMap) -> tuple[int, str]:
     name = path.rsplit("/", 1)[-1]
     if name == "conftest.py" or name == "sitecustomize.py" or name == "usercustomize.py":
         return everything, "pytest-hook-file"
-    if path in PYTEST_CONFIG:
+    in_rootdir_search = "/" not in path or (path.startswith("tests/") and path.count("/") == 1)
+    if name in PYTEST_CONFIG and in_rootdir_search:
+        # pytest looks for its config in tests/ (the argument) and then the repository root.
         return (everything, "pytest-config") if _config_matters(path, fp) else (0, "config-other")
+    if name.endswith(".pth") or (old_path is None and path.endswith(".py") and _shadows_a_module(path)):
+        # A new top-level module (or package) shadows any third-party or sqlglot module of
+        # that name for every test; a new package __init__ shadows a same-named module.
+        return everything, "new-module-shadow"
     if old_path is None:
         # A new file: only code that lists its directory can find it.
         return cov.listers(new_path.rsplit("/", 1)[0] if "/" in new_path else ""), "new-file"
@@ -1089,6 +1209,8 @@ def analyze_file(fp: FilePatch, cov: CoverageMap) -> tuple[int, str]:
         return 0, "unknown-file"
     old = src_file.read_text(encoding="utf-8")
     new, removed, added, anchors = apply_hunks(old, fp.hunks)
+    if _coding_changed(old, new):
+        return cov.importers(path) | cov.openers(path), "coding-declaration"
     sel, kind = analyze_python(path, old, new, removed, added, cov, anchors)
     return sel | cov.openers(path), kind
 

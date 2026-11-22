@@ -978,19 +978,43 @@ def proof_lines(c: Commit) -> dict[str, set[int]]:
     if cached is not None:
         return cached
     out: dict[str, set[int]] = {}
+    blocked = False
     for path, lines in c.changed.items():
         widened = set(lines)
         try:
-            spans = _module_statement_spans(_cached_parse(c.old[path]))
-        except Exception:  # unparsable pinned file: keep the plain lines
-            spans = []
+            tree = _cached_parse(c.old[path])
+            spans = _module_statement_spans(tree)
+            funcs = [(min([f.lineno] + [d.lineno for d in f.decorator_list]), f.end_lineno)
+                     for f in ast.walk(tree) if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        except Exception:  # unparsable pinned file: no proof
+            blocked = True
+            out[path] = widened
+            continue
+        removed = set(c.removed.get(path, ()))
         for line in lines:
+            if line not in removed:
+                # A pure insertion between two old lines: its code may sit at any nesting
+                # of the enclosing function, or at module or class level.
+                inside = [f for f in funcs if f[0] <= line <= f[1]]
+                if not inside:
+                    blocked = True
+                    continue
+                first, last = min(inside, key=lambda f: f[1] - f[0])
+                widened.update(range(first, last + 1))
+                continue
             rng = base._stmt_lines(spans, line)
             if rng is not None:
                 widened.update(range(rng[0], rng[1] + 1))
         out[path] = widened
     c._proof_lines = out
+    c._proof_blocked = blocked
     return out
+
+
+def proof_blocked(c: Commit) -> bool:
+    """An insertion that may land outside every function: no line-based proof."""
+    proof_lines(c)
+    return c._proof_blocked
 
 
 def prove_tpcds_staged(c: Commit, cov, tests: list[dict], durations: list[int]) -> None:
@@ -1015,6 +1039,8 @@ def prove_tpcds_staged(c: Commit, cov, tests: list[dict], durations: list[int]) 
         raw["late_sets"] = {p: set(ls) for p, ls in raw["late"].items()}
         raw["body_sets"] = {p: set(ls) for p, ls in raw["body"].items()}
     need: set[int] = set()
+    if proof_blocked(c):
+        return
     for path, lines in proof_lines(c).items():
         late, body = raw["late_sets"].get(path, ()), raw["body_sets"].get(path, ())
         early = raw["early"].get(path, {})
@@ -1111,6 +1137,8 @@ def prove_tpcds_codegen(c: Commit, cov, tests: list[dict], durations: list[int])
     n_entries = len(raw["early_digest"])
     need: set[int] = set()
     body_paths = []
+    if proof_blocked(c):
+        return
     lines_by_path = proof_lines(c)
     gen_path = "sqlglot/executor/python.py"
     if gen_path in lines_by_path:
@@ -1213,6 +1241,8 @@ def prove_tpcds(c: Commit, cov, tests: list[dict], durations: list[int]) -> None
     if not raw:
         return
     need: set[int] = set()
+    if proof_blocked(c):
+        return
     for path, lines in proof_lines(c).items():
         by_line = raw["lines"].get(path, {})
         body = set(raw["body"].get(path, ()))
@@ -1290,6 +1320,8 @@ def prove_genmem(c: Commit, cov, tests: list[dict], durations: list[int]) -> Non
     if not raw:
         return
     need: set[int] = set()
+    if proof_blocked(c):
+        return
     for path, lines in proof_lines(c).items():
         by_line = raw["lines"].get(path, {})
         for line in lines:
