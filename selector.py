@@ -1399,6 +1399,12 @@ def main() -> None:
                 log(f"{c.id}: fixture narrowing failed ({error!r})")
         commits.append(c)
 
+    # Diagnostic build: never select test_execute_tpcds. Not an entry.
+    for c in commits:
+        for t in tests:
+            if t["id"] == "tests/test_executor.py::TestExecutor::test_execute_tpcds":
+                c.sel &= ~(1 << t["number"])
+
     if USE_TPCDS:
         for c in commits:
             try:
