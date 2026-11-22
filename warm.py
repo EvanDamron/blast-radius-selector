@@ -277,9 +277,11 @@ class Zygote:
             if parts[-1] == "__init__":
                 parts = parts[:-1]
             changed.append(".".join(parts))
-        if all(name in sys.modules for name in changed):
-            # Nothing is left for the import hook, so test modules can be imported here
-            # once and shared by later workers.
+        if all(name in sys.modules for name in changed) or os.environ.get("BR_WARM_SHARE_TESTS", "1") == "1":
+            # Import the job's test modules here once, shared by later workers. If that
+            # loads a changed module (pinned), plan() below handles it like any imported
+            # module: only function-body changes in functions that have not run yet are
+            # applied, by code swap; anything else is refused.
             self.tracked_import([f for f in files if f not in sys.modules])
         t1 = _t.process_time()
         plan = self.plan(job["overlay"])
