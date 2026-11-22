@@ -1645,6 +1645,27 @@ def main() -> None:
                 log(f"{c.id}: fixture narrowing failed ({error!r})")
         commits.append(c)
 
+    # Diagnostic build: keep only selections justified by executed lines inside function
+    # bodies (base evidence stmt/func) and fixture openers; drop module-level and
+    # importer fallbacks; never select the three heavy tests. Not an entry.
+    heavy = {"tests/test_parser.py::TestParser::test_max_nodes",
+             "tests/test_executor.py::TestExecutor::test_execute_tpcds",
+             "tests/test_generator.py::TestGenerator::test_generator_memory"}
+    for c in commits:
+        for path in list(c.file_sel):
+            if path in c.fixtures:
+                continue
+            kinds = [k.split(":", 1)[1] for k in c.kinds if k.startswith(f"{path}:")]
+            if any(k.split(" ", 1)[0] not in ("stmt", "func") for k in kinds):
+                c.file_sel[path] = 0
+        total = 0
+        for b in c.file_sel.values():
+            total |= b
+        c.sel = (c.sel & c.other_sel) | (c.sel & total)
+        for t in tests:
+            if t["id"] in heavy:
+                c.sel &= ~(1 << t["number"])
+
     if USE_TPCDS:
         for c in commits:
             try:
