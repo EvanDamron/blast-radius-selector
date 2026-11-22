@@ -628,6 +628,36 @@ def _star_importers(module: str) -> list[str]:
     return out
 
 
+def _only_removals(old_tree, new_tree) -> bool:
+    """The module-level change can only take names away, never fail at import by itself:
+    every new top-level statement is an old one, an old `from x import ...` with fewer
+    names, or an undecorated function with simple defaults (a rename). Nothing touches
+    `from __future__` (that changes how the whole module compiles)."""
+    old_dumps = {ast.dump(st) for st in old_tree.body}
+    old_from = [st for st in old_tree.body if isinstance(st, ast.ImportFrom)]
+    for tree in (old_tree, new_tree):
+        for st in tree.body:
+            if isinstance(st, ast.ImportFrom) and st.module == "__future__":
+                if ast.dump(st) not in {ast.dump(x) for x in new_tree.body} or ast.dump(st) not in old_dumps:
+                    return False
+    simple = (ast.Constant, ast.Name, ast.Attribute)
+    for st in new_tree.body:
+        if ast.dump(st) in old_dumps:
+            continue
+        if isinstance(st, ast.ImportFrom):
+            names = {(a.name, a.asname) for a in st.names}
+            if any(o.module == st.module and o.level == st.level and names <= {(a.name, a.asname) for a in o.names}
+                   for o in old_from):
+                continue
+            return False
+        if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)) and not st.decorator_list:
+            defaults = st.args.defaults + [d for d in st.args.kw_defaults if d is not None]
+            if all(isinstance(d, simple) for d in defaults):
+                continue
+        return False
+    return True
+
+
 def _gone_names_users(path: str, old_tree, gone: set[str], cov: CoverageMap) -> int | None:
     """Tests that can notice module-level names disappearing from `path`: those that
     fetched a name from the module (or from a package that star-imports it), and
@@ -700,7 +730,7 @@ def module_level(path: str, old_tree, new_tree, cov: CoverageMap) -> tuple[int, 
     imp = cov.importers(path)
     gone = _module_names(old_tree) - _module_names(new_tree)
     if gone:
-        narrowed = _gone_names_users(path, old_tree, gone, cov)
+        narrowed = _gone_names_users(path, old_tree, gone, cov) if _only_removals(old_tree, new_tree) else None
         if narrowed is not None:
             return narrowed & imp, [f"module-name-removed(users) {','.join(sorted(gone))[:80]}"]
         # `from module import name` now fails at import time in every importer.

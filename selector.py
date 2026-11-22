@@ -31,6 +31,7 @@ import base_selector as base  # noqa: E402
 DATA = base.DATA
 SRC = base.SRC
 CMP_MAP = Path(os.environ.get("BR_CMP", str(HERE / "map" / "cmp.json.gz")))
+REL_MAP = Path(os.environ.get("BR_REL", str(HERE / "map" / "rel.json.gz")))
 WORKER_COST = 2000
 MAX_WORKERS = 8
 
@@ -210,6 +211,36 @@ class CmpMap:
         return self.bits(i) if i >= 0 else 0
 
 
+class RelMap:
+    """map/rel.json.gz: for each comparison and each test, the relation signatures of the
+    operands that test produced (T/F/X/N for ==, !=, <, <=, >, >=, is, is not)."""
+
+    def __init__(self, path: Path):
+        with gzip.open(path, "rb") as fh:
+            raw = json.loads(fh.read())
+        self.sets = raw["sets"]
+        self.sites = raw["sites"]
+        self._bits: dict[int, int] = {}
+
+    def bits(self, i: int) -> int:
+        b = self._bits.get(i)
+        if b is None:
+            b = self._bits[i] = int(self.sets[i], 16)
+        return b
+
+    def differing(self, path: str, line: int, col: int, new_op: int, old_op: int) -> int | None:
+        """Tests that produced operands on which the two relations do not agree (or on
+        which either could not be evaluated to a bool). None when the site never ran."""
+        site = self.sites.get(path, {}).get(f"{line}:{col}")
+        if site is None:
+            return None
+        out = 0
+        for sig, i in site.items():
+            if sig == "*" or sig[old_op] != sig[new_op] or sig[old_op] not in "TF":
+                out |= self.bits(i)
+        return out
+
+
 def _single_op_change(old_tree: ast.AST, new_tree: ast.AST, lines: list[int]):
     """If the two trees differ only in the operator of single-operator comparisons,
     return [(old Compare node, new operator index)], else None.
@@ -279,7 +310,10 @@ def narrow_by_comparisons(c: Commit, cmp_map: CmpMap) -> None:
             continue
         keep = 0
         for node, new_op in changes:
-            d = cmp_map.differing(path, node.lineno, node.col_offset, new_op)
+            if isinstance(cmp_map, RelMap):
+                d = cmp_map.differing(path, node.lineno, node.col_offset, new_op, _CMP_OPS.index(type(node.ops[0])))
+            else:
+                d = cmp_map.differing(path, node.lineno, node.col_offset, new_op)
             if d is None:
                 # The comparison never ran in any test process: nothing can observe it.
                 continue
@@ -1244,17 +1278,20 @@ def main() -> None:
     for patch in sorted((DATA / "commits").glob("*.patch")):
         text = patch.read_text(encoding="utf-8", errors="replace")
         c = analyze(patch.stem, text, cov, valid)
-        if USE_CMP and c.sel and c.file_sel and CMP_MAP.exists():
+        if USE_CMP and c.sel and c.file_sel and (CMP_MAP.exists() or REL_MAP.exists()):
             try:
                 if cmp_map is None:
-                    cmp_map = CmpMap(CMP_MAP)
+                    cmp_map = RelMap(REL_MAP) if REL_MAP.exists() else CmpMap(CMP_MAP)
                 narrow_by_comparisons(c, cmp_map)
             except Exception as error:
                 log(f"{c.id}: comparison narrowing failed ({error!r})")
-        if (USE_ATTR or USE_DICT) and c.sel and c.file_sel:
+        if (USE_ATTR or USE_DICT) and c.file_sel:
             saved = (c.sel, dict(c.file_sel))
             try:
-                narrow_by_reads(c)
+                import more
+
+                more.narrow_class_level(c, cov)
+                more.narrow_module_level(c, cov)
             except Exception as error:
                 c.sel, c.file_sel = saved
                 log(f"{c.id}: read narrowing failed ({error!r})")
