@@ -93,7 +93,11 @@ before:
   entries' early stages (parsing, the executor's optimizer call, the DuckDB
   transpile) and never in pickling, schema and table setup, planning, execution or
   module-level code, it compares only those stages' outputs, since the later stages
-  then receive identical input and run identical code.
+  then receive identical input and run identical code. A third form goes one stage
+  further (`map/tpcds_codegen.json.gz`): it also compares the plan and the Python
+  source the executor's generator emits for every step, so only the executor's
+  runtime is assumed unchanged; a class-level constant may change there if no
+  execution-time line mentions it.
 - **`test_generator_memory`**: `map/genmem.json.gz` records which lines each
   dialect's subtest reaches; the selector re-runs only the affected dialects'
   generator loop and memory check on the patched code, and drops the test if they

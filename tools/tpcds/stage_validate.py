@@ -29,7 +29,7 @@ T = 1106
 PY = str(ROOT / "work/venv/bin/python")
 CHILD = r'''
 import json, signal, sys
-src, overlay_file, need_file, out = sys.argv[1:5]
+src, overlay_file, need_file, out, DIGEST = sys.argv[1:6]
 sys.path.insert(0, src); sys.path.insert(1, "%s")
 from execrun import _OverlayFinder
 sys.meta_path.insert(0, _OverlayFinder(src, json.load(open(overlay_file))))
@@ -43,7 +43,7 @@ try:
     for i in need:
         signal.alarm(30)
         try:
-            res[i] = tpcds_harness.early_digest(pairs[i], tables)
+            res[i] = getattr(tpcds_harness, DIGEST)(pairs[i], tables)
         except BaseException as e:
             res[i] = "error:" + type(e).__name__
         signal.alarm(0)
@@ -68,6 +68,38 @@ def load_stages(d):
     return late, body, early, pinned
 
 
+_late_text = {}
+
+
+def name_in_late(name, late):
+    """Whether any execution-time line mentions the name (word match)."""
+    import re
+    if "pattern_lines" not in _late_text:
+        lines = []
+        for p, l in late:
+            try:
+                src = _late_text.setdefault(p, (base.SRC / p).read_text().split("\n"))
+            except OSError:
+                continue
+            lines.append(src[l - 1])
+        _late_text["pattern_lines"] = "\n".join(lines)
+    return re.search(rf"\b{re.escape(name)}\b", _late_text["pattern_lines"]) is not None
+
+
+def body_value_change(path, old, new):
+    """Name of the single class-level assignment whose value changed, or None."""
+    import ast
+    sys.path.insert(0, str(ROOT))
+    import selector as S
+    ch = S.class_level_change(ast.parse(old), ast.parse(new))
+    if ch is None:
+        return None
+    _, a, b, _ = ch
+    n1, _ = S._assign(a)
+    n2, _ = S._assign(b)
+    return n1 if n1 and n1 == n2 else None
+
+
 def main():
     stages, dump = sys.argv[1], Path(sys.argv[2])
     jobs = int(sys.argv[3]) if len(sys.argv) > 3 else 4
@@ -88,9 +120,12 @@ def main():
                 old = (base.SRC / path).read_text()
                 new, removed, _, anchors = base.apply_hunks(old, fp.hunks)
                 overlay[path] = new
+                body_name = body_value_change(path, old, new) if os.environ.get("BR_ALLOW_BODY") == "1" else None
                 for ln in set(removed) | {a for p in anchors for a in (p, p + 1)}:
                     k = (path, ln)
-                    if k in late or k in body:
+                    if k in body and k not in late and body_name and not name_in_late(body_name, late):
+                        need |= set(range(len(pinned)))  # class bodies run at import for every entry
+                    elif k in late or k in body:
                         why = "late-or-body"
                     elif k in early:
                         need |= early[k]
@@ -109,7 +144,8 @@ def main():
             json.dump(overlay, open(of, "w"))
             json.dump(need, open(nf, "w"))
             try:
-                subprocess.run([PY, "-c", CHILD, str(base.SRC), of, nf, out], capture_output=True, timeout=600)
+                subprocess.run([PY, "-c", CHILD, str(base.SRC), of, nf, out, os.environ.get("BR_DIGEST", "early_digest")],
+                               capture_output=True, timeout=600)
                 res = json.load(open(out))
             except Exception:
                 return s, c, fails, "crash", None

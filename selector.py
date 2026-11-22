@@ -1009,6 +1009,120 @@ def prove_tpcds_staged(c: Commit, cov, tests: list[dict], durations: list[int]) 
         c.sel &= ~(1 << t)
 
 
+TPCDS_CODEGEN_MAP = HERE / "map" / "tpcds_codegen.json.gz"
+
+
+def _late_mentions(raw, name: str) -> bool:
+    """Whether any execution-time line of any entry mentions the name (word match)."""
+    if "late_text" not in raw:
+        chunks = []
+        for p, ls in raw["late"].items():
+            try:
+                src = (SRC / p).read_text(encoding="utf-8").split("\n")
+            except OSError:
+                return True
+            chunks.extend(src[l - 1] for l in ls if l <= len(src))
+        raw["late_text"] = "\n".join(chunks)
+    return __import__("re").search(rf"\b{__import__('re').escape(name)}\b", raw["late_text"]) is not None
+
+
+def prove_tpcds_codegen(c: Commit, cov, tests: list[dict], durations: list[int]) -> None:
+    """Like prove_tpcds_staged, one stage further: the early stages also cover planning
+    and the Python source PythonGenerator emits for every step (tpcds_harness.
+    codegen_digest), so only the executor's runtime runs on what they produce. Changed
+    lines must not run at execution time. A class-level constant may change if no
+    execution-time line mentions its name; class bodies run at import, so every entry
+    is then re-digested."""
+    t = next((x["number"] for x in tests if x["id"] == TPCDS_TEST), None)
+    if t is None or not (c.sel >> t) & 1 or c.fixtures or not c.overlay or not c.executable:
+        return
+    if any(not p.startswith("sqlglot/") for p in c.overlay) or c.other_sel:
+        return
+    raw = _maps.get("tpcds_codegen")
+    if raw is None:
+        raw = _maps["tpcds_codegen"] = (json.loads(gzip.decompress(TPCDS_CODEGEN_MAP.read_bytes()))
+                                        if TPCDS_CODEGEN_MAP.exists() else {})
+    if not raw:
+        return
+    if "late_sets" not in raw:
+        raw["late_sets"] = {p: set(ls) for p, ls in raw["late"].items()}
+        raw["body_sets"] = {p: set(ls) for p, ls in raw["body"].items()}
+    n_entries = len(raw["early_digest"])
+    need: set[int] = set()
+    body_paths = []
+    # Cheap set lookups first; parsing for the class-constant case only once it can pay.
+    for path, lines in c.changed.items():
+        late, body = raw["late_sets"].get(path, ()), raw["body_sets"].get(path, ())
+        early = raw["early"].get(path, {})
+        for line in lines:
+            if line in late:
+                return
+            if line in body:
+                body_paths.append(path)
+                need.update(range(n_entries))  # class bodies run at import for every entry
+                continue
+            entries = early.get(str(line))
+            if entries:
+                need.update(entries)
+            elif (cov.at_line(path, line) >> t) & 1:
+                return
+    if not need:
+        return
+    numbers = numbers_of(c.sel)
+    saving = split(numbers, durations)[0] - split([n for n in numbers if n != t], durations)[0]
+    estimate = TPCDS_FIXED_MS + TPCDS_CPU_FACTOR * sum(raw["early_ms"][e] for e in need)
+    if estimate > TPCDS_SHARE * saving or _tpcds_wall[0] > TPCDS_WALL_BUDGET:
+        return
+    for path in set(body_paths):
+        # A module- or class-level line may change only as one class-level constant
+        # whose name no execution-time line mentions.
+        try:
+            change = class_level_change(ast.parse(c.old[path]), ast.parse(c.overlay[path]))
+        except SyntaxError:
+            return
+        if change is None:
+            return
+        n1, _ = _assign(change[1])
+        n2, _ = _assign(change[2])
+        if not n1 or n1 != n2 or _late_mentions(raw, n1):
+            return
+    order = sorted(need)
+    expected = [raw["early_digest"][e] for e in order]
+    start = time.monotonic()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    pid = os.fork()
+    if pid == 0:
+        code = 2
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, 1)
+            signal.alarm(int(3 * estimate / 1000) + 10)
+            sys.path.insert(0, str(SRC))
+            from execrun import _OverlayFinder
+
+            sys.meta_path.insert(0, _OverlayFinder(str(SRC), c.overlay))
+            import tpcds_harness
+            from tests.helpers import load_sql_fixture_pairs
+
+            pairs = list(load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))
+            tables = tpcds_harness.load_tables()
+            code = 0
+            for e, digest in zip(order, expected):
+                if tpcds_harness.codegen_digest(pairs[e], tables) != digest:
+                    code = 1
+                    break
+        except BaseException:  # noqa: BLE001 - any failure means no proof
+            code = 2
+        os._exit(code)
+    _, status = os.waitpid(pid, 0)
+    _tpcds_wall[0] += time.monotonic() - start
+    ok = os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+    c.note += f" tpcds-codegen:{len(order)}entries:{'same' if ok else 'differs'}"
+    if ok:
+        c.sel &= ~(1 << t)
+
+
 def prove_tpcds(c: Commit, cov, tests: list[dict], durations: list[int]) -> None:
     """Drop test_execute_tpcds when re-running, on the patched code, every TPC-DS entry
     whose own run reached a changed line reproduces that entry's pinned digest
@@ -1536,6 +1650,8 @@ def main() -> None:
             try:
                 if os.environ.get("BR_USE_TPCDS_STAGED", "1") == "1":
                     prove_tpcds_staged(c, cov, tests, durations)
+                if "tpcds-staged" not in c.note and os.environ.get("BR_USE_TPCDS_CODEGEN", "1") == "1":
+                    prove_tpcds_codegen(c, cov, tests, durations)
             except Exception as error:
                 log(f"{c.id}: staged tpcds proof failed ({error!r})")
             try:
