@@ -103,6 +103,16 @@ before:
   generator loop and memory check on the patched code, and drops the test if they
   all pass.
 
+- **Small candidate sets are run** (`BR_USE_EXEC`, on in the image): when a
+  commit's remaining candidates take at most about 1 s, a warm process that has
+  imported the pinned sqlglot forks a worker, gives it the patch (a not-yet-imported
+  module is served patched by an import hook; an imported one may differ only in
+  function bodies that have not run yet, and its function objects get the new
+  code), and runs the candidates through unittest, cheapest first, stopping at the
+  first failure. If they all pass the commit selects nothing; otherwise the
+  selection stands. Patches the warm process cannot apply exactly keep their
+  selection.
+
 The selected tests are split by longest-processing-time first, for whichever
 worker count from 1 to 8 gives the lowest cost (busiest worker plus 2 s per
 worker).

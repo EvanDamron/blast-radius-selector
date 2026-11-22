@@ -9,7 +9,9 @@ RUN python /tmp/fetch_sqlglot.py ${SQLGLOT_COMMIT} /opt/sqlglot && test -f /opt/
 COPY selector.py base_selector.py more.py execrun.py warm.py tpcds_harness.py genmem_harness.py /app/
 COPY map /app/map
 # The disk is read-only at run time: compile everything now.
-RUN chmod -R a+rX /opt/sqlglot /app && python -m compileall -q /app /opt/sqlglot/sqlglot /opt/sqlglot/tests/helpers.py
+RUN chmod -R a+rX /opt/sqlglot /app && python -m compileall -q /app /opt/sqlglot/sqlglot /opt/sqlglot/tests
 ENV PYTHONDONTWRITEBYTECODE=1
+# Run small candidate sets against the patched code in a warm process (see README).
+ENV BR_USE_EXEC=1 BR_USE_WARM=1 BR_WARM_ONLY=1 BR_EXEC_LIMIT_MS=1000
 # Imported as a module so the bytecode compiled above is used (a script is recompiled every run).
 CMD ["python", "-c", "import sys; sys.path.insert(0, '/app'); import selector; selector.main()"]

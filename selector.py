@@ -1273,6 +1273,7 @@ def prove_genmem(c: Commit, cov, tests: list[dict], durations: list[int]) -> Non
 USE_WARM = os.environ.get("BR_USE_WARM", "0") == "1"
 STOP_ON_FAIL = os.environ.get("BR_STOP_ON_FAIL", "1") == "1"
 PARALLEL = int(os.environ.get("BR_PARALLEL", "2"))
+WARM_ONLY = os.environ.get("BR_WARM_ONLY", "0") == "1"
 _THIRD_PARTY = ("numpy", "pandas", "duckdb")
 
 
@@ -1455,7 +1456,8 @@ def run_all(jobs: list[Job], start: float) -> None:
     never ran keeps mode ""."""
     if not jobs:
         return
-    preload_third_party(jobs)
+    if not (USE_WARM and WARM_ONLY):
+        preload_third_party(jobs)  # the warm process imports what its jobs need itself
     warm = None
     if USE_WARM:
         try:
@@ -1500,7 +1502,12 @@ def run_all(jobs: list[Job], start: float) -> None:
                 if j is None or j.mode == "cold":
                     continue
                 if words[1] == b"cold":
-                    j.start_cold()
+                    if WARM_ONLY:
+                        # A fresh interpreter costs a full sqlglot import: keep the selection.
+                        j.finished, j.mode = True, ""
+                        j.c.note += " exec-refused"
+                    else:
+                        j.start_cold()
                 elif words[1] == b"pid":
                     j.pid = int(words[2])
                     j.mode = "warm"
