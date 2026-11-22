@@ -1431,6 +1431,8 @@ def prove_optfix(c: Commit, cov, tests: list[dict], durations: list[int]) -> Non
         return
     if any(not p.startswith("sqlglot/") for p in c.overlay) or c.other_sel:
         return
+    if proof_blocked(c):
+        return
     raw = _maps.get("optfix")
     if raw is None:
         raw = _maps["optfix"] = json.loads(gzip.decompress(OPTFIX_MAP.read_bytes())) if OPTFIX_MAP.exists() else {}
