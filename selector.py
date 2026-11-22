@@ -1111,8 +1111,21 @@ def prove_tpcds_codegen(c: Commit, cov, tests: list[dict], durations: list[int])
     n_entries = len(raw["early_digest"])
     need: set[int] = set()
     body_paths = []
+    lines_by_path = proof_lines(c)
+    gen_path = "sqlglot/executor/python.py"
+    if gen_path in lines_by_path:
+        # The digest calls what PythonExecutor.generate calls (_replace_subqueries and the
+        # generator) but not generate itself, so a change to its own lines (the compile()
+        # call, the arguments it passes) would not show in the digest.
+        for node in ast.walk(_cached_parse(c.old[gen_path])):
+            if isinstance(node, ast.ClassDef) and node.name == "PythonExecutor":
+                for f in node.body:
+                    if isinstance(f, ast.FunctionDef) and f.name == "generate":
+                        first = min([f.lineno] + [d.lineno for d in f.decorator_list])
+                        if any(first <= ln <= f.end_lineno for ln in lines_by_path[gen_path]):
+                            return
     # Cheap set lookups first; parsing for the class-constant case only once it can pay.
-    for path, lines in proof_lines(c).items():
+    for path, lines in lines_by_path.items():
         late, body = raw["late_sets"].get(path, ()), raw["body_sets"].get(path, ())
         early = raw["early"].get(path, {})
         for line in lines:
