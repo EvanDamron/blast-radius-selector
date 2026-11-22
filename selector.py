@@ -1414,7 +1414,7 @@ def prove_optfix(c: Commit, cov, tests: list[dict], durations: list[int]) -> Non
             continue
         need: set[int] = set()
         ok = True
-        for path, lines in c.changed.items():
+        for path, lines in proof_lines(c).items():
             outside = (imported.get(path, set()) | imported_body.get(path, set())
                        | set(t["body"].get(path, ())) | set(t["skeleton"].get(path, ())))
             by_line = t["lines"].get(path, {})
