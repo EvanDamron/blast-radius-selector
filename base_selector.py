@@ -877,7 +877,7 @@ def module_level(path: str, old_tree, new_tree, cov: CoverageMap) -> tuple[int, 
             sel |= readers(set(name), cov, span) & imp
             notes.append(f"readers {where}")
             continue
-        if not prefix and (path.startswith("tests/") or path.startswith("sqlglot/")):
+        if not prefix and (path.startswith("tests/") or path.startswith("sqlglot/")) and _side_effecting(o, n):
             # pytest imports every test module (and what they import at the top) into each
             # worker before any test runs: a module-level statement's side effects (logging,
             # warnings, patches, registries) reach every test, not just the importers.
@@ -887,6 +887,41 @@ def module_level(path: str, old_tree, new_tree, cov: CoverageMap) -> tuple[int, 
         sel |= imp
         notes.append(f"importers {where}")
     return sel, notes
+
+
+def _is_type_checking_if(node) -> bool:
+    if not isinstance(node, ast.If):
+        return False
+    test = node.test.operand if isinstance(node.test, ast.UnaryOp) and isinstance(node.test.op, ast.Not) else node.test
+    return (isinstance(test, ast.Name) and test.id == "TYPE_CHECKING") or (
+        isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING")
+
+
+def _is_main_guard(node) -> bool:
+    """`if __name__ == "__main__":` runs only when the file is executed as a script."""
+    t = getattr(node, "test", None)
+    return (isinstance(node, ast.If) and isinstance(t, ast.Compare) and isinstance(t.left, ast.Name)
+            and t.left.id == "__name__" and len(t.comparators) == 1
+            and isinstance(t.comparators[0], ast.Constant) and t.comparators[0].value == "__main__")
+
+
+def _side_effecting(o, n) -> bool:
+    """A module-level statement that can change process-wide state when it runs: a call
+    expression, a loop, with, try, or an if (other than an `if TYPE_CHECKING:` block of
+    imports, whose effect is importing pinned modules)."""
+    for node in (o, n):
+        if node is None:
+            continue
+        if _is_type_checking_if(node) or _is_main_guard(node):
+            continue
+        if isinstance(node, (ast.With, ast.AsyncWith, ast.For, ast.AsyncFor, ast.While, ast.Try, ast.If,
+                             ast.Delete, ast.Global, ast.Nonlocal, ast.Assert, ast.Raise)):
+            return True
+        if isinstance(node, ast.Expr) and any(isinstance(x, (ast.Call, ast.Await)) for x in ast.walk(node)):
+            return True
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+    return False
 
 
 _COPIERS: dict = {}
@@ -1076,6 +1111,21 @@ def _stmt_spans(func) -> list[tuple[int, int, int, int]]:
     return out
 
 
+_SESSION_ONLY: dict = {}
+
+
+def session_only_lines(path: str) -> set[int]:
+    """Lines a pytest session runs in tests the isolated per-test map did not record
+    (map/session_only.json)."""
+    if "lines" not in _SESSION_ONLY:
+        try:
+            raw = json.loads((Path(MAP).parent / "session_only.json").read_text())["lines"]
+        except Exception:
+            raw = {}
+        _SESSION_ONLY["lines"] = {p: set(v) for p, v in raw.items()}
+    return _SESSION_ONLY["lines"].get(path, set())
+
+
 def _depth(spans, line: int) -> int:
     """How many compound statements' bodies contain the line."""
     return sum(1 for first, last, header_last, compound in spans if compound and header_last < line <= last)
@@ -1168,9 +1218,9 @@ def analyze_python(path: str, old: str, new: str, removed, added, cov: CoverageM
                     ok = False
                     continue
                 part = cov.func_lines(path, rng[0], rng[1], include_body=True)
-                if not part and whole:
-                    # No isolated run reached this statement, yet the function runs: a path
-                    # that depends on state left by earlier tests in the same worker.
+                if set(range(rng[0], rng[1] + 1)) & session_only_lines(path):
+                    # Run under pytest -n by tests whose isolated run never reached it
+                    # (state left by earlier tests in the worker): every caller.
                     ok = False
                 s |= part
             if ok:
@@ -1285,7 +1335,7 @@ def analyze_file(fp: FilePatch, cov: CoverageMap) -> tuple[int, str]:
     if _coding_changed(old, new):
         return cov.importers(path) | cov.openers(path), "coding-declaration"
     sel, kind = analyze_python(path, old, new, removed, added, cov, anchors)
-    if path.startswith("sqlglot/typing/"):
+    if path.startswith("sqlglot/typing/") and kind != "no-code-change":
         # test_no_redundant_expression_metadata compares the annotators' code objects
         # without calling them: coverage cannot link it to these files.
         sel |= _tests_named("tests/test_typing.py::")

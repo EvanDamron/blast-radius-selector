@@ -1,0 +1,17 @@
+{
+ "note": "Lines that a real pytest -n session runs in tests whose isolated per-test run did not: Dialect._try_load re-registers a class from an already-imported module after tests/test_dialect_entry_points.py clears Dialect._classes. Measured by diffing per-test coverage of a full xdist session against map/cov.json.gz at the pinned commit.",
+ "lines": {
+  "sqlglot/dialects/dialect.py": [
+   248,
+   249,
+   250,
+   251,
+   252,
+   253,
+   254,
+   255,
+   256,
+   257
+  ]
+ }
+}

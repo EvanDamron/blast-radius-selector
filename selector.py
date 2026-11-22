@@ -998,14 +998,11 @@ def proof_lines(c: Commit) -> dict[str, set[int]]:
         whole_function = ":func " in kinds or " func " in kinds
         for line in lines:
             inside = [f for f in funcs if f[0] <= line <= f[1]]
-            if _PROOF_COV is not None:
-                rng = base._stmt_lines(spans, line) or (line, line)
-                if inside and not _PROOF_COV.func_lines(path, rng[0], rng[1], include_body=True):
-                    first, last = min(inside, key=lambda f: f[1] - f[0])
-                    if _PROOF_COV.func_lines(path, first, last, include_body=True):
-                        # The function runs but no isolated run reached this statement:
-                        # a path that depends on state from earlier tests. No proof.
-                        blocked = True
+            rng = base._stmt_lines(spans, line) or (line, line)
+            if set(range(rng[0], rng[1] + 1)) & base.session_only_lines(path):
+                # Code a pytest session runs in tests whose isolated runs never reached it:
+                # re-running entries in isolation cannot show the change. No proof.
+                blocked = True
             if whole_function or line not in removed:
                 # A pure insertion between two old lines: its code may sit at any nesting
                 # of the enclosing function, or at module or class level.
