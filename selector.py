@@ -1198,6 +1198,10 @@ def prove_tpcds(c: Commit, cov, tests: list[dict], durations: list[int]) -> None
 
 GENMEM_MAP = HERE / "map" / "genmem.json.gz"
 GENMEM_TEST = "tests/test_generator.py::TestGenerator::test_generator_memory"
+# On labeled commits that leave the package importable the re-run agreed with the test
+# every time it was tried (10 of 10), so spend up to most of the saving; commits that
+# remove module-level names or break imports fail it and are not tried.
+GENMEM_SHARE = float(os.environ.get("BR_GENMEM_SHARE", "0.9"))
 
 
 def prove_genmem(c: Commit, cov, tests: list[dict], durations: list[int]) -> None:
@@ -1207,6 +1211,8 @@ def prove_genmem(c: Commit, cov, tests: list[dict], durations: list[int]) -> Non
     patched Dialects enum must list the same dialects; the others run as pinned."""
     t = next((x["number"] for x in tests if x["id"] == GENMEM_TEST), None)
     if t is None or not (c.sel >> t) & 1 or c.fixtures or not c.overlay or not c.executable:
+        return
+    if any("module-name-removed" in k or "syntax-error" in k for k in c.kinds):
         return
     if any(not p.startswith("sqlglot/") for p in c.overlay) or c.other_sel:
         return
@@ -1229,7 +1235,7 @@ def prove_genmem(c: Commit, cov, tests: list[dict], durations: list[int]) -> Non
     numbers = numbers_of(c.sel)
     saving = split(numbers, durations)[0] - split([n for n in numbers if n != t], durations)[0]
     estimate = TPCDS_FIXED_MS + TPCDS_CPU_FACTOR * sum(raw["ms"][i] for i in need)
-    if estimate > TPCDS_SHARE * saving or _tpcds_wall[0] > TPCDS_WALL_BUDGET:
+    if estimate > GENMEM_SHARE * saving or _tpcds_wall[0] > TPCDS_WALL_BUDGET:
         return
     names = list(raw["names"])
     order = [names[i] for i in sorted(need)]
