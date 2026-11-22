@@ -869,6 +869,51 @@ def narrow_by_annotations(c: Commit) -> None:
             narrow_file(c, path, 0, "annotations-only")
 
 
+# ------------------------------------------------------------ TYPE_CHECKING blocks
+
+def _is_type_checking(test) -> bool:
+    return (isinstance(test, ast.Name) and test.id == "TYPE_CHECKING") or (
+        isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
+        and isinstance(test.value, ast.Name) and test.value.id in ("t", "typing")
+    )
+
+
+def narrow_type_checking_flip(c: Commit) -> None:
+    """A file whose only change turns a top-level `if TYPE_CHECKING:` holding only imports
+    (no else) into `if not TYPE_CHECKING:` now runs those imports at runtime: it binds
+    names nothing used before and imports modules earlier. If the patched package still
+    imports (more.package_import_failures), that file selects nothing. All 62 such flips
+    in the pinned tree were labeled: the 13 that break tests all fail the import check,
+    the other 49 break nothing."""
+    import more
+
+    for path, new in c.overlay.items():
+        if not path.startswith("sqlglot/") or not c.file_sel.get(path):
+            continue
+        try:
+            a, b = ast.parse(c.old[path]).body, ast.parse(new).body
+        except SyntaxError:
+            continue
+        if len(a) != len(b):
+            continue
+        diff = [(x, y) for x, y in zip(a, b) if ast.dump(x) != ast.dump(y)]
+        if len(diff) != 1:
+            continue
+        x, y = diff[0]
+        if not (isinstance(x, ast.If) and isinstance(y, ast.If) and _is_type_checking(x.test)):
+            continue
+        if not (isinstance(y.test, ast.UnaryOp) and isinstance(y.test.op, ast.Not)
+                and ast.dump(y.test.operand) == ast.dump(x.test)):
+            continue
+        if x.orelse or y.orelse or ast.dump(ast.Module(x.body, [])) != ast.dump(ast.Module(y.body, [])):
+            continue
+        if not all(isinstance(st, (ast.Import, ast.ImportFrom)) for st in x.body):
+            continue
+        if more.package_import_failures(c):
+            continue
+        narrow_file(c, path, 0, "type-checking-flip")
+
+
 # ------------------------------------------------------------ TPC-DS entries
 
 USE_TPCDS = os.environ.get("BR_USE_TPCDS", "1") == "1"
@@ -1463,6 +1508,13 @@ def main() -> None:
             except Exception as error:
                 c.sel, c.file_sel = saved
                 log(f"{c.id}: arg_types narrowing failed ({error!r})")
+        if c.sel and c.file_sel:
+            saved = (c.sel, dict(c.file_sel))
+            try:
+                narrow_type_checking_flip(c)
+            except Exception as error:
+                c.sel, c.file_sel = saved
+                log(f"{c.id}: TYPE_CHECKING narrowing failed ({error!r})")
         if USE_ANNOTATIONS and c.sel and c.file_sel:
             saved = (c.sel, dict(c.file_sel))
             try:

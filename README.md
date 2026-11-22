@@ -75,6 +75,10 @@ before:
   module with `from __future__ import annotations`): nothing. They are never
   evaluated and nothing reads a function's `__annotations__`; class- and
   module-level annotations are not covered (dataclasses read them).
+- **`if TYPE_CHECKING:` flipped to `if not TYPE_CHECKING:`** (a block of imports, no
+  else): nothing, provided the patched package still imports in a child process.
+  All 62 such blocks in the pinned tree were flipped and labeled: the 13 that break
+  tests all fail that import check; the other 49 break nothing.
 - **A SQL fixture changed**: keep the tests that read a part of the file that
   differs (a file the helpers can no longer load keeps every test that opens it).
 - Tests that open the changed source file as data are always kept.
