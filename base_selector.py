@@ -811,6 +811,11 @@ def module_level(path: str, old_tree, new_tree, cov: CoverageMap) -> tuple[int, 
                 sel |= imp
                 notes.append(f"dunder-assign {where}")
                 continue
+            if not prefix and path.startswith("tests/") and any(
+                    isinstance(x, ast.Call) for v in (o, n) if v is not None for x in ast.walk(v)):
+                sel |= (1 << cov.n) - 1  # a call at a test module's top level runs at collection
+                notes.append(f"module-call {where}")
+                continue
             if any(t.endswith("_sql") for t in name):
                 # Generators dispatch by scanning dir(cls) for `<key>_sql`.
                 bits = 0
@@ -826,7 +831,8 @@ def module_level(path: str, old_tree, new_tree, cov: CoverageMap) -> tuple[int, 
             span = (path, node.lineno, node.end_lineno) if o is not None else (path, 0, -1)
             exprs = _expr_class_of(path, prefix)
             if exprs and not set(name) & {"_sql_names", "key"}:
-                sel |= instantiators(exprs, cov) | readers(set(name), cov, span, tests_only=True)
+                cls_name = prefix.rstrip(".").split(".")[-1]
+                sel |= instantiators(exprs | _copiers(cls_name, set(name)), cov) | readers(set(name), cov, span, tests_only=True)
                 notes.append(f"expr-attr {where}")
                 continue
             ov = getattr(o, "value", None)
@@ -838,11 +844,17 @@ def module_level(path: str, old_tree, new_tree, cov: CoverageMap) -> tuple[int, 
                 changed = {k for k, _, v in oe if (k, sdump(v)) not in nset} | {
                     k for k, _, v in ne if (k, sdump(v)) not in oset}
                 bits, ok = 0, True
+                added_keys = {k for k, _, _ in ne} - {k for k, _, _ in oe}
                 for k in changed:
                     ents = [e for e in oe + ne if e[0] == k]
                     kb, kfound = value_signals([e[1] for e in ents], cov)
                     if kfound and _expr_refs_any([e[1] for e in ents]):
                         bits |= kb  # keyed by expression class: only its users see the entry
+                        continue
+                    if k in added_keys:
+                        # Before, a lookup of this key missed and took some other path:
+                        # who built the new value says nothing about who looked it up.
+                        ok = False
                         continue
                     vb, vfound = value_signals([e[2] for e in ents], cov)
                     if vfound:
@@ -865,9 +877,48 @@ def module_level(path: str, old_tree, new_tree, cov: CoverageMap) -> tuple[int, 
             sel |= readers(set(name), cov, span) & imp
             notes.append(f"readers {where}")
             continue
+        if not prefix and (path.startswith("tests/") or path.startswith("sqlglot/")):
+            # pytest imports every test module (and what they import at the top) into each
+            # worker before any test runs: a module-level statement's side effects (logging,
+            # warnings, patches, registries) reach every test, not just the importers.
+            sel |= (1 << cov.n) - 1
+            notes.append(f"module-statement {where}")
+            continue
         sel |= imp
         notes.append(f"importers {where}")
     return sel, notes
+
+
+_COPIERS: dict = {}
+
+
+def _copiers(cls_name: str, names: set[str]) -> set[str]:
+    """Expression class keys whose class body reads `<cls_name>.<name>` (e.g. Revoke's
+    `arg_types = {**Grant.arg_types, ...}`): they carry the edited value too."""
+    if "index" not in _COPIERS:
+        index: dict = {}
+        for rel, text in sources().items():
+            if not rel.startswith("sqlglot/expressions/") or ".arg_types" not in text and "." not in text:
+                continue
+            try:
+                tree = ast.parse(text)
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ClassDef):
+                    for sub in ast.walk(node):
+                        if isinstance(sub, ast.Attribute) and isinstance(sub.value, ast.Name):
+                            index.setdefault((sub.value.id, sub.attr), set()).add((rel, node.name))
+        _COPIERS["index"] = index
+    keys: set[str] = set()
+    for nm in names:
+        for rel, other in _COPIERS["index"].get((cls_name, nm), ()):
+            if other == cls_name:
+                continue
+            for k in static().expr_by_name.get(other, []):
+                if static().expr[k][0] == rel:
+                    keys.add(k)
+    return keys
 
 
 def _literal_or_none(node):
@@ -1025,6 +1076,11 @@ def _stmt_spans(func) -> list[tuple[int, int, int, int]]:
     return out
 
 
+def _depth(spans, line: int) -> int:
+    """How many compound statements' bodies contain the line."""
+    return sum(1 for first, last, header_last, compound in spans if compound and header_last < line <= last)
+
+
 def _stmt_lines(spans, line: int) -> tuple[int, int] | None:
     """Lines whose execution reveals that the code at `line` ran."""
     best = None
@@ -1095,6 +1151,13 @@ def analyze_python(path: str, old: str, new: str, removed, added, cov: CoverageM
                 ok = False
             if not pts:
                 ok = False
+            # A replaced line that moves to another nesting (a dedent out of an if body)
+            # runs for tests that never ran the old line: use the whole function.
+            new_spans = _stmt_spans(n.node)
+            old_depths = {_depth(spans, ln) for ln in removed if o.first <= ln <= o.last}
+            new_depths = {_depth(new_spans, ln) for ln in added if n.first <= ln <= n.last}
+            if old_depths != new_depths:
+                ok = False
             for ln in pts:
                 rng = _stmt_lines(spans, ln) if o.first <= ln <= o.last else None
                 if rng is None:
@@ -1104,7 +1167,12 @@ def analyze_python(path: str, old: str, new: str, removed, added, cov: CoverageM
                         continue
                     ok = False
                     continue
-                s |= cov.func_lines(path, rng[0], rng[1], include_body=True)
+                part = cov.func_lines(path, rng[0], rng[1], include_body=True)
+                if not part and whole:
+                    # No isolated run reached this statement, yet the function runs: a path
+                    # that depends on state left by earlier tests in the same worker.
+                    ok = False
+                s |= part
             if ok:
                 sel |= s & whole if s else 0
                 kinds.append(f"stmt {q}")
@@ -1217,7 +1285,22 @@ def analyze_file(fp: FilePatch, cov: CoverageMap) -> tuple[int, str]:
     if _coding_changed(old, new):
         return cov.importers(path) | cov.openers(path), "coding-declaration"
     sel, kind = analyze_python(path, old, new, removed, added, cov, anchors)
+    if path.startswith("sqlglot/typing/"):
+        # test_no_redundant_expression_metadata compares the annotators' code objects
+        # without calling them: coverage cannot link it to these files.
+        sel |= _tests_named("tests/test_typing.py::")
     return sel | cov.openers(path), kind
+
+
+def _tests_named(prefix: str) -> int:
+    bits = 0
+    try:
+        for t in json.loads((DATA / "tests.json").read_text())["tests"]:
+            if t["id"].startswith(prefix):
+                bits |= 1 << t["number"]
+    except Exception:
+        pass
+    return bits
 
 
 # ------------------------------------------------------------------------- split

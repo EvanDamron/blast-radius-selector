@@ -968,6 +968,9 @@ def _module_statement_spans(tree: ast.Module) -> list[tuple[int, int, int, int]]
     return out
 
 
+_PROOF_COV = None  # the coverage map, set by main()
+
+
 def proof_lines(c: Commit) -> dict[str, set[int]]:
     """The changed lines of each file, each widened to every line of its statement (the
     header lines of a compound statement). Coverage records lines, and a statement can
@@ -991,8 +994,19 @@ def proof_lines(c: Commit) -> dict[str, set[int]]:
             out[path] = widened
             continue
         removed = set(c.removed.get(path, ()))
+        kinds = " ".join(k for k in c.kinds if k.startswith(path + ":"))
+        whole_function = ":func " in kinds or " func " in kinds
         for line in lines:
-            if line not in removed:
+            inside = [f for f in funcs if f[0] <= line <= f[1]]
+            if _PROOF_COV is not None:
+                rng = base._stmt_lines(spans, line) or (line, line)
+                if inside and not _PROOF_COV.func_lines(path, rng[0], rng[1], include_body=True):
+                    first, last = min(inside, key=lambda f: f[1] - f[0])
+                    if _PROOF_COV.func_lines(path, first, last, include_body=True):
+                        # The function runs but no isolated run reached this statement:
+                        # a path that depends on state from earlier tests. No proof.
+                        blocked = True
+            if whole_function or line not in removed:
                 # A pure insertion between two old lines: its code may sit at any nesting
                 # of the enclosing function, or at module or class level.
                 inside = [f for f in funcs if f[0] <= line <= f[1]]
@@ -1685,6 +1699,8 @@ def main() -> None:
         durations[t["number"]] = int(t["seconds"] * 1000 + 0.5)
     no_exec = {t["number"] for t in tests if t["id"] in NO_EXEC_IDS}
     cov = base.CoverageMap(base.MAP)
+    global _PROOF_COV
+    _PROOF_COV = cov
     valid = (1 << len(tests)) - 1
     if not (SRC / "sqlglot" / "parser.py").exists():
         # Without the pinned source nothing can be analyzed: run everything.
