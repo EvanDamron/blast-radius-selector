@@ -835,6 +835,63 @@ def narrow_by_annotations(c: Commit) -> None:
             narrow_file(c, path, 0, "annotations-only")
 
 
+# ------------------------------------------------------------ heavy tests: expected cost
+
+USE_HEAVY_RISK = os.environ.get("BR_USE_HEAVY_RISK", "1") == "1"
+# The three tests that set most commits' cost. Each is dropped only where its labeled
+# failure rate is below the break-even P(fail) = marginal seconds / 300.
+HEAVY_TESTS = (
+    "tests/test_parser.py::TestParser::test_max_nodes",            # 28.8 s, break-even ~10%
+    "tests/test_executor.py::TestExecutor::test_execute_tpcds",    # 21.5 s, break-even ~8%
+    "tests/test_generator.py::TestGenerator::test_generator_memory",  # 6.7 s, break-even ~3%
+)
+_ATTR_EVIDENCE = ("readers", "family-readers", "expr-attr", "dict-entries")
+
+
+def _class_value_change(old: str, new: str) -> bool:
+    """The file differs in exactly one class-level assignment, the same name, and if
+    both values are dict literals they have the same keys in the same order."""
+    try:
+        change = class_level_change(ast.parse(old), ast.parse(new))
+    except SyntaxError:
+        return False
+    if change is None:
+        return False
+    _, a, b, _ = change
+    name, va = _assign(a)
+    name2, vb = _assign(b)
+    if name is None or name != name2:
+        return False
+    if isinstance(va, ast.Dict) or isinstance(vb, ast.Dict):
+        if not (isinstance(va, ast.Dict) and isinstance(vb, ast.Dict)) or len(va.keys) != len(vb.keys):
+            return False
+        return all((x is None and y is None) or (x is not None and y is not None and ast.dump(x) == ast.dump(y))
+                   for x, y in zip(va.keys, vb.keys))
+    return True
+
+
+def drop_heavy_on_value_changes(c: Commit, tests: list[dict]) -> None:
+    """Calibrated, not proved: when every change is the value of one class-level
+    constant in sqlglot/ (keys unchanged), selected only because tests read that
+    attribute, drop the three heavy tests. On 526 labeled commits this class held
+    22 heavy selections and none failed (max_nodes 0/4, tpcds 0/7,
+    generator_memory 0/11); key renames and edits to tests' own data are excluded."""
+    if not c.overlay or c.fixtures or c.other_sel or not c.executable:
+        return
+    for path, new in c.overlay.items():
+        if not path.startswith("sqlglot/"):
+            return
+        kinds = [k.split(":", 1)[1] for k in c.kinds if k.startswith(f"{path}:")]
+        if not kinds or any(k.split(" ", 1)[0].split("(", 1)[0] not in _ATTR_EVIDENCE for k in kinds):
+            return
+        if not _class_value_change(c.old[path], new):
+            return
+    for t in tests:
+        if t["id"] in HEAVY_TESTS and (c.sel >> t["number"]) & 1:
+            c.sel &= ~(1 << t["number"])
+            c.note += f" heavy-risk:-{t['id'].rsplit('::', 1)[1]}"
+
+
 # ------------------------------------------------------------ TPC-DS entries
 
 USE_TPCDS = os.environ.get("BR_USE_TPCDS", "1") == "1"
@@ -1287,6 +1344,13 @@ def main() -> None:
                 c.sel, c.file_sel = saved
                 log(f"{c.id}: fixture narrowing failed ({error!r})")
         commits.append(c)
+
+    if USE_HEAVY_RISK:
+        for c in commits:
+            try:
+                drop_heavy_on_value_changes(c, tests)
+            except Exception as error:
+                log(f"{c.id}: heavy-risk rule failed ({error!r})")
 
     if USE_TPCDS:
         for c in commits:
