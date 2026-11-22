@@ -3,7 +3,7 @@
 Active only when BRTRACE_DIR is set (inherited by spawned children). Every sqlglot
 module gets a ModuleType subclass as its class before its code runs, whose
 __getattribute__ records (module, name): `from m import x`, `m.x`, getattr and
-hasattr on m, unpickling by name, mock.patch. Code inside the module reads its own
+hasattr on m, unpickling by name, mock.patch (not inspect.getmembers scans). Code inside the module reads its own
 globals directly and is not recorded (coverage covers that). Writes
 BRTRACE_DIR/<pid>.json at exit.
 """
@@ -21,10 +21,17 @@ if _dir:
     _add = _seen.add
     _getattribute = types.ModuleType.__getattribute__
 
+    _getframe = sys._getframe
+
     class _Tracked(types.ModuleType):
         def __getattribute__(self, name):
             if name[:2] != "__":
-                _add((_getattribute(self, "__name__"), name))
+                # inspect.getmembers reads every name; its one user here
+                # (helper.subclasses) keeps only classes, which the selector never
+                # narrows. Not a use of the name.
+                code = _getframe(1).f_code
+                if code.co_name not in ("_getmembers", "getmembers") or not code.co_filename.endswith("inspect.py"):
+                    _add((_getattribute(self, "__name__"), name))
             return _getattribute(self, name)
 
     class _Finder(importlib.abc.MetaPathFinder):

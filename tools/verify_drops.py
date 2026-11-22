@@ -154,7 +154,24 @@ def tpcds_mutants(rng, n):
     return out
 
 
-STAGES = ("BR_USE_DEFAULTS", "BR_USE_FIXTURES", "BR_USE_TPCDS")
+def name_mutants(rng, n):
+    """Removed module-level names: dropped imports, renamed functions, dropped re-exports."""
+    sys.path.insert(0, str(ROOT / "tools"))
+    import mutate
+
+    files = mutate.py_files("sqlglot")
+    out = []
+    while len(out) < n:
+        kind = rng.choice(["importdrop", "rename", "reexport"])
+        try:
+            (path, old, new), = mutate.one(rng, kind, files)
+        except Exception:
+            continue
+        out.append(("names", diff(path, old, new)))
+    return out
+
+
+STAGES = ("BR_USE_DEFAULTS", "BR_USE_FIXTURES", "BR_USE_TPCDS", "BR_USE_MODATTR")
 
 
 def select(data, env_name, on):
@@ -176,7 +193,7 @@ def main():
     rng = random.Random(a.seed)
     out = Path(a.out)
     (out / "commits").mkdir(parents=True, exist_ok=True)
-    gens = {"argtypes": argtypes_mutants, "default": default_mutants, "fixture": fixture_mutants, "tpcds": tpcds_mutants}
+    gens = {"argtypes": argtypes_mutants, "default": default_mutants, "fixture": fixture_mutants, "tpcds": tpcds_mutants, "names": name_mutants}
     muts = [m for k in a.kinds.split(",") for m in gens[k](rng, a.count)]
     kinds = {}
     for i, (kind, patch) in enumerate(muts):

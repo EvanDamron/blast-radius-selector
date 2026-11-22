@@ -635,7 +635,9 @@ def _gone_names_users(path: str, old_tree, gone: set[str], cov: CoverageMap) -> 
     that is not enough: classes (namespace scans find them without fetching by
     name), decorated functions, dunder names, and modules with __getattr__,
     __all__ or globals() writes."""
-    if _modattr() is None or not path.startswith("sqlglot/") or not path.endswith(".py"):
+    if os.environ.get("BR_USE_MODATTR", "1") != "1" or _modattr() is None:
+        return None
+    if not path.startswith("sqlglot/") or not path.endswith(".py"):
         return None
     module = path[:-3].replace("/", ".")
     if module.endswith(".__init__"):
