@@ -887,7 +887,12 @@ def _postponed_annotations(tree) -> bool:
 def _runs_at_definition_differs(o, n, new_tree) -> bool:
     """Whether code that runs when the def statement runs differs: decorators, default
     values that are not both literals, and annotations unless they are postponed."""
-    if [sdump(d) for d in o.decorator_list] != [sdump(d) for d in n.decorator_list]:
+    # property, classmethod and staticmethod only build a descriptor: adding or removing
+    # one changes what callers get, and every such caller ran the body.
+    def decorators(f):
+        return [sdump(d) for d in f.decorator_list
+                if not (isinstance(d, ast.Name) and d.id in ("property", "classmethod", "staticmethod"))]
+    if decorators(o) != decorators(n):
         return True
     od = list(o.args.defaults) + list(o.args.kw_defaults)
     nd = list(n.args.defaults) + list(n.args.kw_defaults)
