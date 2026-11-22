@@ -806,6 +806,14 @@ def module_level(path: str, old_tree, new_tree, cov: CoverageMap) -> tuple[int, 
                     notes.append(f"new-def(unreferenced) {where}")
             continue
         if kind == "assign":
+            if (path.startswith("sqlglot/") or path.startswith("tests/")) and any(
+                    _mutates_elsewhere(v) for v in (o, n) if v is not None):
+                # `exp.X.__repr__ = ...`, `Parser.FUNCTIONS["X"] = ...`, `X |= {...}`: changes
+                # state owned elsewhere when the module or class body runs; collection runs
+                # it in every worker.
+                sel |= (1 << cov.n) - 1
+                notes.append(f"mutating-assign {where}")
+                continue
             if any(t.startswith("__") and t.endswith("__") for t in name):
                 # __slots__, __hash__, __eq__ = ..., __match_args__...: read implicitly.
                 sel |= imp
@@ -877,7 +885,9 @@ def module_level(path: str, old_tree, new_tree, cov: CoverageMap) -> tuple[int, 
             sel |= readers(set(name), cov, span) & imp
             notes.append(f"readers {where}")
             continue
-        if not prefix and (path.startswith("tests/") or path.startswith("sqlglot/")) and _side_effecting(o, n):
+        if (path.startswith("tests/") or path.startswith("sqlglot/")) and (
+                (not prefix and _side_effecting(o, n))
+                or (prefix and _class_body_side_effect(o, n, prefix, old_tree, new_tree))):
             # pytest imports every test module (and what they import at the top) into each
             # worker before any test runs: a module-level statement's side effects (logging,
             # warnings, patches, registries) reach every test, not just the importers.
@@ -895,6 +905,60 @@ def _is_type_checking_if(node) -> bool:
     test = node.test.operand if isinstance(node.test, ast.UnaryOp) and isinstance(node.test.op, ast.Not) else node.test
     return (isinstance(test, ast.Name) and test.id == "TYPE_CHECKING") or (
         isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING")
+
+
+def _mutates_elsewhere(node) -> bool:
+    """An assignment whose target is an attribute or subscript (state of another
+    object), or an augmented assignment (which can mutate a shared object in place)."""
+    if isinstance(node, ast.AugAssign):
+        return True
+    targets = node.targets if isinstance(node, ast.Assign) else [getattr(node, "target", None)]
+    for t in targets:
+        if t is None:
+            continue
+        for x in ast.walk(t):
+            if isinstance(x, (ast.Attribute, ast.Subscript)):
+                return True
+    return False
+
+
+def _class_node(tree, prefix: str):
+    names = prefix.rstrip(".").split(".")
+    body = tree.body
+    node = None
+    for nm in names:
+        node = next((st for st in body if isinstance(st, ast.ClassDef) and st.name == nm), None)
+        if node is None:
+            return None
+        body = node.body
+    return node
+
+
+def _class_body_side_effect(o, n, prefix, old_tree, new_tree) -> bool:
+    """A non-definition statement in a class body runs when the class is created, in
+    every worker at collection. Only a method call on a name the same class body binds
+    (redshift's `KEYWORDS.pop(...)` on its own fresh dict) stays local."""
+    for node, tree in ((o, old_tree), (n, new_tree)):
+        if node is None:
+            continue
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+            func = node.value.func
+            cls = _class_node(tree, prefix)
+            own = set()
+            if cls is not None:
+                for st in cls.body:
+                    if isinstance(st, (ast.Assign, ast.AnnAssign)):
+                        tg = st.targets if isinstance(st, ast.Assign) else [st.target]
+                        own |= {t.id for t in tg if isinstance(t, ast.Name)}
+            if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id in own:
+                continue
+            return True
+        if isinstance(node, (ast.Expr,)) and not any(isinstance(x, (ast.Call, ast.Await)) for x in ast.walk(node)):
+            continue  # a bare constant or name
+        if isinstance(node, (ast.Import, ast.ImportFrom, ast.Pass)):
+            continue
+        return True
+    return False
 
 
 def _is_main_guard(node) -> bool:
