@@ -932,6 +932,67 @@ _tpcds_wall = [0.0]
 TPCDS_STAGES_MAP = HERE / "map" / "tpcds_stages.json.gz"
 
 
+def _module_statement_spans(tree: ast.Module) -> list[tuple[int, int, int, int]]:
+    """(first, last, header_last, compound) for every statement in a module, nested
+    function and class bodies included. A def or class statement's own lines are its
+    decorators and header."""
+    out = []
+
+    def visit(stmts):
+        for st in stmts:
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                first = min([st.lineno] + [d.lineno for d in st.decorator_list])
+                out.append((first, st.end_lineno, max(st.lineno, st.body[0].lineno - 1), 1))
+                visit(st.body)
+                continue
+            children = [v for f in ("body", "orelse", "finalbody")
+                        if isinstance(v := getattr(st, f, None), list) and v and isinstance(v[0], ast.stmt)]
+            handlers = getattr(st, "handlers", None) or []
+            cases = getattr(st, "cases", None) or []
+            if children or handlers or cases:
+                first_child = min([ch[0].lineno for ch in children] + [h.lineno for h in handlers]
+                                  + [cs.pattern.lineno for cs in cases])
+                out.append((st.lineno, st.end_lineno, max(st.lineno, first_child - 1), 1))
+                for ch in children:
+                    visit(ch)
+                for h in handlers:
+                    out.append((h.lineno, h.end_lineno, max(h.lineno, h.body[0].lineno - 1), 1))
+                    visit(h.body)
+                for cs in cases:
+                    out.append((cs.pattern.lineno, cs.body[-1].end_lineno, max(cs.pattern.lineno, cs.body[0].lineno - 1), 1))
+                    visit(cs.body)
+            else:
+                out.append((st.lineno, st.end_lineno, st.end_lineno, 0))
+
+    visit(tree.body)
+    return out
+
+
+def proof_lines(c: Commit) -> dict[str, set[int]]:
+    """The changed lines of each file, each widened to every line of its statement (the
+    header lines of a compound statement). Coverage records lines, and a statement can
+    run without its changed line firing: in `a(...)\n or b(...)` the second line only
+    fires when a() is falsy, yet changing `or` alters every run of the statement. A
+    proof must treat any line of the statement as reaching the change."""
+    cached = getattr(c, "_proof_lines", None)
+    if cached is not None:
+        return cached
+    out: dict[str, set[int]] = {}
+    for path, lines in c.changed.items():
+        widened = set(lines)
+        try:
+            spans = _module_statement_spans(_cached_parse(c.old[path]))
+        except Exception:  # unparsable pinned file: keep the plain lines
+            spans = []
+        for line in lines:
+            rng = base._stmt_lines(spans, line)
+            if rng is not None:
+                widened.update(range(rng[0], rng[1] + 1))
+        out[path] = widened
+    c._proof_lines = out
+    return out
+
+
 def prove_tpcds_staged(c: Commit, cov, tests: list[dict], durations: list[int]) -> None:
     """Drop test_execute_tpcds when every changed line runs only in the early stages of
     the TPC-DS entries (parse, the executor's optimize, the DuckDB transpile: never in
@@ -954,7 +1015,7 @@ def prove_tpcds_staged(c: Commit, cov, tests: list[dict], durations: list[int]) 
         raw["late_sets"] = {p: set(ls) for p, ls in raw["late"].items()}
         raw["body_sets"] = {p: set(ls) for p, ls in raw["body"].items()}
     need: set[int] = set()
-    for path, lines in c.changed.items():
+    for path, lines in proof_lines(c).items():
         late, body = raw["late_sets"].get(path, ()), raw["body_sets"].get(path, ())
         early = raw["early"].get(path, {})
         for line in lines:
@@ -1051,7 +1112,7 @@ def prove_tpcds_codegen(c: Commit, cov, tests: list[dict], durations: list[int])
     need: set[int] = set()
     body_paths = []
     # Cheap set lookups first; parsing for the class-constant case only once it can pay.
-    for path, lines in c.changed.items():
+    for path, lines in proof_lines(c).items():
         late, body = raw["late_sets"].get(path, ()), raw["body_sets"].get(path, ())
         early = raw["early"].get(path, {})
         for line in lines:
@@ -1139,7 +1200,7 @@ def prove_tpcds(c: Commit, cov, tests: list[dict], durations: list[int]) -> None
     if not raw:
         return
     need: set[int] = set()
-    for path, lines in c.changed.items():
+    for path, lines in proof_lines(c).items():
         by_line = raw["lines"].get(path, {})
         body = set(raw["body"].get(path, ()))
         for line in lines:
@@ -1216,7 +1277,7 @@ def prove_genmem(c: Commit, cov, tests: list[dict], durations: list[int]) -> Non
     if not raw:
         return
     need: set[int] = set()
-    for path, lines in c.changed.items():
+    for path, lines in proof_lines(c).items():
         by_line = raw["lines"].get(path, {})
         for line in lines:
             entries = by_line.get(str(line))
