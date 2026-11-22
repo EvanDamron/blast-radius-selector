@@ -955,6 +955,80 @@ def prove_tpcds(c: Commit, cov, tests: list[dict], durations: list[int]) -> None
         c.sel &= ~(1 << t)
 
 
+# ------------------------------------------------------------ generator memory
+
+GENMEM_MAP = HERE / "map" / "genmem.json.gz"
+GENMEM_TEST = "tests/test_generator.py::TestGenerator::test_generator_memory"
+
+
+def prove_genmem(c: Commit, cov, tests: list[dict], durations: list[int]) -> None:
+    """Drop test_generator_memory when its subtests for every dialect whose own run
+    reached a changed line still pass on the patched code (genmem_harness.run_dialect:
+    load the dialect, build its generator 1,100 times, memory must stay flat). The
+    patched Dialects enum must list the same dialects; the others run as pinned."""
+    t = next((x["number"] for x in tests if x["id"] == GENMEM_TEST), None)
+    if t is None or not (c.sel >> t) & 1 or c.fixtures or not c.overlay or not c.executable:
+        return
+    if any(not p.startswith("sqlglot/") for p in c.overlay) or c.other_sel:
+        return
+    raw = _maps.get("genmem")
+    if raw is None:
+        raw = _maps["genmem"] = json.loads(gzip.decompress(GENMEM_MAP.read_bytes())) if GENMEM_MAP.exists() else {}
+    if not raw:
+        return
+    need: set[int] = set()
+    for path, lines in c.changed.items():
+        by_line = raw["lines"].get(path, {})
+        for line in lines:
+            entries = by_line.get(str(line))
+            if entries:
+                need.update(entries)
+            elif (cov.at_line(path, line) >> t) & 1:
+                return  # the test runs this line outside the dialect loop
+    if not need:
+        return
+    numbers = numbers_of(c.sel)
+    saving = split(numbers, durations)[0] - split([n for n in numbers if n != t], durations)[0]
+    estimate = TPCDS_FIXED_MS + TPCDS_CPU_FACTOR * sum(raw["ms"][i] for i in need)
+    if estimate > TPCDS_SHARE * saving or _tpcds_wall[0] > TPCDS_WALL_BUDGET:
+        return
+    names = list(raw["names"])
+    order = [names[i] for i in sorted(need)]
+    start = time.monotonic()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    pid = os.fork()
+    if pid == 0:
+        code = 2
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, 1)
+            signal.alarm(int(3 * estimate / 1000) + 10)
+            sys.path.insert(0, str(SRC))
+            from execrun import _OverlayFinder
+
+            sys.meta_path.insert(0, _OverlayFinder(str(SRC), c.overlay))
+            import genmem_harness
+
+            if genmem_harness.dialect_names() != names:
+                code = 3
+            else:
+                code = 0
+                for name in order:
+                    if not genmem_harness.run_dialect(name):
+                        code = 1
+                        break
+        except BaseException:  # noqa: BLE001 - any failure means no proof
+            code = 2
+        os._exit(code)
+    _, status = os.waitpid(pid, 0)
+    _tpcds_wall[0] += time.monotonic() - start
+    ok = os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+    c.note += f" genmem-proof:{len(order)}dialects:{'pass' if ok else 'no'}"
+    if ok:
+        c.sel &= ~(1 << t)
+
+
 # ------------------------------------------------------------------- execution
 
 USE_WARM = os.environ.get("BR_USE_WARM", "0") == "1"
@@ -1331,6 +1405,10 @@ def main() -> None:
                 prove_tpcds(c, cov, tests, durations)
             except Exception as error:
                 log(f"{c.id}: tpcds proof failed ({error!r})")
+            try:
+                prove_genmem(c, cov, tests, durations)
+            except Exception as error:
+                log(f"{c.id}: generator memory proof failed ({error!r})")
 
     final: dict[str, list[int]] = {}
     jobs: list[Job] = []

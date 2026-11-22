@@ -6,7 +6,7 @@ ARG SQLGLOT_COMMIT=eb11aec4be8cb2122afe713a4816662c3f0fb2fa
 COPY fetch_sqlglot.py /tmp/fetch_sqlglot.py
 RUN python /tmp/fetch_sqlglot.py ${SQLGLOT_COMMIT} /opt/sqlglot && test -f /opt/sqlglot/sqlglot/parser.py
 
-COPY selector.py base_selector.py more.py execrun.py warm.py tpcds_harness.py /app/
+COPY selector.py base_selector.py more.py execrun.py warm.py tpcds_harness.py genmem_harness.py /app/
 COPY map /app/map
 # The disk is read-only at run time: compile everything now.
 RUN chmod -R a+rX /opt/sqlglot /app && python -m compileall -q /app /opt/sqlglot/sqlglot /opt/sqlglot/tests/helpers.py
