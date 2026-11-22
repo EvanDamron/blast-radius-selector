@@ -102,3 +102,18 @@ worker).
 
 Sample set: 101.4 s simulated with 0 misses, against 1614.1 s for the starter.
 Synthetic sets (399 labeled mutations of many kinds): 0 misses.
+
+## Open-source software used
+
+- **Runtime** (the submitted image): the `python:3.13-slim` Docker image and the
+  Python standard library. The build downloads sqlglot (MIT) at the pinned
+  commit `eb11aec`, whose source the selector compares patches against and whose
+  TPC-DS fixtures and executor it runs to check digests.
+- **Map building and local evaluation** (`tools/`, not in the image): sqlglot's
+  own test suite and its locked dependencies (`tools/requirements.lock`), notably
+  pytest, pytest-xdist and pytest-timeout, plus duckdb, numpy and pandas, which
+  the suite needs. `tools/evaluate.py` uses the scorer shipped in the track's
+  starter kit.
+
+Everything else here (the selector, the maps and the tools) is our own work,
+released under the MIT License (`LICENSE`).
