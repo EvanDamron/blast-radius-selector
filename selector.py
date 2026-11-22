@@ -1288,6 +1288,16 @@ def main() -> None:
                 log(f"{c.id}: fixture narrowing failed ({error!r})")
         commits.append(c)
 
+    # Diagnostic build: never select the three heavy tests, to measure their share of
+    # the practice cost and how often they fail there. Not an entry.
+    heavy = {"tests/test_parser.py::TestParser::test_max_nodes",
+             "tests/test_executor.py::TestExecutor::test_execute_tpcds",
+             "tests/test_generator.py::TestGenerator::test_generator_memory"}
+    for c in commits:
+        for t in tests:
+            if t["id"] in heavy:
+                c.sel &= ~(1 << t["number"])
+
     if USE_TPCDS:
         for c in commits:
             try:
