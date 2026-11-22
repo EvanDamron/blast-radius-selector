@@ -1351,6 +1351,12 @@ def _shadows_a_module(path: str) -> bool:
     return (SRC / stem).is_dir()
 
 
+_PROCESS_WIDE = re.compile(
+    r"\blogging\.(?:disable|basicConfig|captureWarnings|root\b)|\.setLevel\(|\bwarnings\.|\bos\.environ\b"
+    r"|\bos\.(?:putenv|unsetenv|chdir)\(|\bsys\.(?:setrecursionlimit|path|modules|settrace|setprofile|stdout|stderr)\b"
+    r"|\.start\(\)|\bsetattr\(|\bdelattr\(|\bgc\.(?:disable|freeze)\(")
+
+
 _CODING = re.compile(r"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")
 
 
@@ -1396,6 +1402,12 @@ def analyze_file(fp: FilePatch, cov: CoverageMap) -> tuple[int, str]:
         return 0, "unknown-file"
     old = src_file.read_text(encoding="utf-8")
     new, removed, added, anchors = apply_hunks(old, fp.hunks)
+    if path.startswith("tests/"):
+        changed = [h[1:] for _, _, body in fp.hunks for h in body if h[:1] in "+-"]
+        if any(_PROCESS_WIDE.search(line) for line in changed):
+            # A test that changes process-wide state without restoring it affects later
+            # tests in the same worker, whichever they are.
+            return everything, "process-wide-state"
     if _coding_changed(old, new):
         return cov.importers(path) | cov.openers(path), "coding-declaration"
     sel, kind = analyze_python(path, old, new, removed, added, cov, anchors)
